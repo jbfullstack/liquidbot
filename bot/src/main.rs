@@ -375,8 +375,10 @@ async fn main() -> Result<()> {
     }
 
     // ── Shared state for command handler ──
-    let shared_tracked  = Arc::new(RwLock::new(tracked));
-    let shared_at_risk  = Arc::new(RwLock::new(at_risk));
+    let shared_tracked   = Arc::new(RwLock::new(tracked));
+    let shared_at_risk   = Arc::new(RwLock::new(at_risk));
+    let shared_eth_bal   = Arc::new(RwLock::new(eth_bal));
+    let shared_eth_price = Arc::new(RwLock::new(eth_price_usd));
     // Snapshot of at-risk positions for /hf command: (address, hf, debt_usd), sorted HF asc
     let shared_hf_list: Arc<RwLock<Vec<(String, f64, f64)>>> = Arc::new(RwLock::new(Vec::new()));
 
@@ -388,11 +390,13 @@ async fn main() -> Result<()> {
 
     // ── Spawn Telegram command listener (separate task, never blocks bot) ──
     if let Some(ref tg) = tg {
-        let tg_cmd = tg.clone();
-        let tracked_ref = shared_tracked.clone();
-        let risk_ref    = shared_at_risk.clone();
-        let active_ref  = bot_active.clone();
-        let hf_ref      = shared_hf_list.clone();
+        let tg_cmd    = tg.clone();
+        let tracked_ref   = shared_tracked.clone();
+        let risk_ref      = shared_at_risk.clone();
+        let active_ref    = bot_active.clone();
+        let hf_ref        = shared_hf_list.clone();
+        let eth_bal_ref   = shared_eth_bal.clone();
+        let eth_price_ref = shared_eth_price.clone();
         let hot = format!("{wallet_addr}");
         tokio::spawn(async move {
             tg_cmd.run_command_listener(
@@ -405,9 +409,11 @@ async fn main() -> Result<()> {
                 cmd_tx,
                 hf_ref,
                 cfg.health_factor_threshold,
+                eth_bal_ref,
+                eth_price_ref,
             ).await;
         });
-        tracing::info!("📱 Telegram commands: /status /stats /json /hf /help /stop_bot /start_bot /pause_contract /resume_contract");
+        tracing::info!("📱 Telegram commands: /status /stats /json /hf /gas /help /stop_bot /start_bot /pause_contract /resume_contract");
     }
 
     // ── pending_liquidations: prevents double-sending on the same user ──
@@ -435,6 +441,8 @@ async fn main() -> Result<()> {
     let mut stats_profit = 0.0f64;
     // Track price for flash-crash detection
     let mut prev_eth_price = eth_price_usd;
+    // Last block we sent a low-gas alert (avoid spam)
+    let mut last_gas_alert_block: u64 = 0;
 
     use futures_util::StreamExt;
 
@@ -593,6 +601,47 @@ async fn main() -> Result<()> {
                                 }
                             }
                             prev_eth_price = p;
+                            *shared_eth_price.write().await = p;
+
+                            // Refresh ETH balance + auto low-gas alert
+                            let bal_wei = http_ro.get_balance(wallet_addr).await.unwrap_or(U256::ZERO);
+                            let bal = bal_wei.to::<u128>() as f64 / 1e18;
+                            *shared_eth_bal.write().await = bal;
+
+                            // Compute days remaining from stats and alert if < 7
+                            let s = StatsStore::load();
+                            let total_ops = s.total_successes() + s.total_failures();
+                            if total_ops > 0 {
+                                let days_active = {
+                                    use chrono::{NaiveDate, Utc};
+                                    if let Ok(start) = NaiveDate::parse_from_str(&s.started_at, "%Y-%m-%d") {
+                                        (Utc::now().date_naive() - start).num_days().max(1) as f64
+                                    } else { 1.0 }
+                                };
+                                let avg_gas_per_day = s.total_gas() / days_active;
+                                let days_remaining = if avg_gas_per_day > 0.0 {
+                                    (bal * p) / avg_gas_per_day
+                                } else { f64::INFINITY };
+
+                                const ALERT_DAYS: f64 = 7.0;
+                                const ALERT_COOLDOWN_BLOCKS: u64 = 2000; // ~8 min
+                                if days_remaining < ALERT_DAYS
+                                    && bn.saturating_sub(last_gas_alert_block) > ALERT_COOLDOWN_BLOCKS
+                                {
+                                    last_gas_alert_block = bn;
+                                    tracing::warn!("⛽ Gas faible: ~{:.1} jours restants", days_remaining);
+                                    if let Some(ref tg) = tg {
+                                        let msg = format!(
+                                            "⚡ LiqBot ⛽ <b>Gas faible !</b>\n\
+                                            Solde: <b>{bal:.5} ETH</b> (~${:.2})\n\
+                                            Estimation: <b>{:.1} jours</b> restants\n\
+                                            ⚠️ Recharge le hot wallet !",
+                                            bal * p, days_remaining
+                                        );
+                                        tg.send_raw(&msg).await;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("ETH price refresh failed: {e}");

@@ -301,6 +301,8 @@ impl TelegramNotifier {
         cmd_sender: tokio::sync::mpsc::Sender<TelegramCommand>,
         hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
         hf_threshold: f64,
+        eth_balance: Arc<tokio::sync::RwLock<f64>>,
+        eth_price: Arc<tokio::sync::RwLock<f64>>,
     ) {
         // Separate client with long timeout for Telegram long-polling
         let poll_client = reqwest::Client::builder()
@@ -390,6 +392,67 @@ impl TelegramNotifier {
                         self.send_document(&stats_path).await;
                     }
 
+                    "/gas" => {
+                        let bal   = *eth_balance.read().await;
+                        let price = *eth_price.read().await;
+                        let bal_usd = bal * price;
+                        let stats = crate::stats::StatsStore::load();
+                        let total_ops = stats.total_successes() + stats.total_failures();
+
+                        let msg = if total_ops == 0 {
+                            // Pas encore de données réelles — estimation théorique
+                            let est_ops = (bal_usd / 0.20).floor() as u64;
+                            format!(
+                                "{} ⛽ <b>Gas &amp; estimations</b>\n\
+                                \n\
+                                Solde: <b>{:.5} ETH</b> (~${:.2})\n\
+                                \n\
+                                📊 Pas encore de données (0 opérations)\n\
+                                   Estimation théorique à $0.20/op:\n\
+                                   ~<b>{est_ops} opérations</b> restantes\n\
+                                \n\
+                                ⚠️ Alerte auto si &lt; 7 jours estimés",
+                                self.bot_name, bal, bal_usd,
+                            )
+                        } else {
+                            let days_active = {
+                                use chrono::{NaiveDate, Utc};
+                                if let Ok(start) = NaiveDate::parse_from_str(&stats.started_at, "%Y-%m-%d") {
+                                    (Utc::now().date_naive() - start).num_days().max(1) as f64
+                                } else { 1.0 }
+                            };
+                            let total_gas  = stats.total_gas();
+                            let avg_per_op  = total_gas / total_ops as f64;
+                            let avg_per_day = total_gas / days_active;
+                            let ops_left  = if avg_per_op  > 0.0 { (bal_usd / avg_per_op).floor()  as i64 } else { 9999 };
+                            let days_left = if avg_per_day > 0.0 { (bal_usd / avg_per_day).floor() as i64 } else { 9999 };
+                            let alert_icon = if days_left < 7 { "🔴" } else if days_left < 14 { "🟡" } else { "🟢" };
+
+                            format!(
+                                "{} ⛽ <b>Gas &amp; estimations</b>\n\
+                                \n\
+                                Solde: <b>{:.5} ETH</b> (~${:.2})\n\
+                                \n\
+                                📊 Base ({} ops sur {:.0} jours):\n\
+                                   Gas total brûlé: ${:.4}\n\
+                                   Coût moyen/op:   ${:.4}\n\
+                                   Coût moyen/jour: ${:.4}\n\
+                                \n\
+                                ⏱️ Estimations (solde ÷ coût moy):\n\
+                                   ~<b>{ops_left} opérations</b> restantes\n\
+                                   ~<b>{days_left} jours</b> restants\n\
+                                \n\
+                                {} Alerte auto si &lt; 7 jours estimés",
+                                self.bot_name,
+                                bal, bal_usd,
+                                total_ops, days_active,
+                                total_gas, avg_per_op, avg_per_day,
+                                alert_icon,
+                            )
+                        };
+                        self.send(&msg).await;
+                    }
+
                     "/hf" => {
                         let list = hf_list.read().await;
                         if list.is_empty() {
@@ -442,6 +505,7 @@ impl TelegramNotifier {
                             /status — état du bot (up/down, uptime)\n\
                             /stats — bilan complet P&amp;L\n\
                             /hf — positions à risque (HF, dette, adresse)\n\
+                            /gas — solde ETH + estimation ops/jours restants\n\
                             /json — télécharger stats.json\n\
                             \n\
                             <b>Contrôle bot:</b>\n\
