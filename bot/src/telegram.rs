@@ -1,0 +1,439 @@
+//! Telegram notification module
+//!
+//! Sends structured messages to your Telegram chat for every bot action.
+//! Setup: message @BotFather on Telegram → /newbot → get token
+//! Then message your bot, visit https://api.telegram.org/bot<TOKEN>/getUpdates
+//! to find your chat_id.
+
+use eyre::Result;
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct TelegramNotifier {
+    token: String,
+    chat_id: String,
+    client: reqwest::Client,
+    bot_name: String,
+}
+
+impl TelegramNotifier {
+    pub fn new(token: &str, chat_id: &str) -> Self {
+        Self {
+            token: token.to_string(),
+            chat_id: chat_id.to_string(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("http client"),
+            bot_name: "⚡ LiqBot".to_string(),
+        }
+    }
+
+    /// Send a raw HTML message (public for special cases like shutdown)
+    pub async fn send_raw(&self, text: &str) {
+        self.send(text).await;
+    }
+
+    /// Send a raw HTML message (internal)
+    async fn send(&self, text: &str) {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
+        let _ = self.client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+            }))
+            .send()
+            .await;
+        // Fire-and-forget: don't let Telegram errors crash the bot
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // STARTUP
+    // ─────────────────────────────────────────────────────────
+
+    pub async fn notify_startup(
+        &self,
+        hot_wallet: &str,
+        cold_wallet: &str,
+        contract: &str,
+        eth_balance: f64,
+        users_tracked: usize,
+        at_risk: u32,
+    ) {
+        let msg = format!(
+            "{} <b>Bot démarré</b>\n\
+            \n\
+            🔑 Hot: <code>{}</code>\n\
+            🏦 Cold: <code>{}</code>\n\
+            📄 Contract: <code>{}</code>\n\
+            ⛽ ETH: <b>{:.6} ETH</b>\n\
+            👥 Users suivis: <b>{}</b>\n\
+            ⚠️ À risque: <b>{}</b>",
+            self.bot_name, 
+            &hot_wallet[..8], &cold_wallet[..8], &contract[..8],
+            eth_balance, users_tracked, at_risk
+        );
+        self.send(&msg).await;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // LIQUIDATION COMPLETE — single combined message (post-tx)
+    // Called AFTER the tx result is known. Zero latency impact.
+    // ─────────────────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn notify_liquidation_complete(
+        &self,
+        // Context
+        user: &str,
+        health_factor: f64,
+        debt_usd: f64,
+        debt_token: &str,
+        debt_amount: &str,
+        collateral_token: &str,
+        collateral_amount: &str,
+        close_factor_pct: u8,
+        gas_estimate: u64,
+        gas_cost_usd: f64,
+        expected_profit_usd: f64,
+        // Result
+        success: bool,
+        tx_hash: &str,
+        failure_reason: &str,
+        // Financials
+        profit_usd: f64,
+        gas_paid_usd: f64,
+        net_profit_usd: f64,
+        // Wallet
+        hot_eth: f64,
+        // Full stats summary (pre-formatted)
+        stats_summary: &str,
+    ) {
+        let status = if success { "✅ Réussie" } else { "❌ Échouée" };
+        let emoji = if success { "💰" } else { "💸" };
+
+        let mut msg = format!(
+            "{} <b>{} Liquidation {}</b>\n\
+            \n\
+            👤 <code>{}</code> | HF: <b>{:.4}</b>\n\
+            💸 {} {} (~${:.2})\n\
+            🛡️ {} {}\n\
+            📊 Close {}% | Gas {} (~${:.4})\n",
+            self.bot_name, emoji, status,
+            &user[..user.len().min(10)],
+            health_factor,
+            debt_amount, debt_token, debt_usd,
+            collateral_amount, collateral_token,
+            close_factor_pct, gas_estimate, gas_cost_usd,
+        );
+
+        if !tx_hash.is_empty() {
+            msg.push_str(&format!(
+                "🔗 <a href=\"https://arbiscan.io/tx/{}\">Arbiscan</a>\n",
+                tx_hash,
+            ));
+        }
+
+        msg.push('\n');
+
+        if success {
+            msg.push_str(&format!(
+                "✨ <b>+${:.4}</b> (brut ${:.4} - gas ${:.4})\n",
+                net_profit_usd, profit_usd, gas_paid_usd,
+            ));
+        } else {
+            msg.push_str(&format!(
+                "❓ {}\n⛽ Gas perdu: -${:.4}\n",
+                failure_reason, gas_paid_usd,
+            ));
+        }
+
+        msg.push_str(&format!("🔑 Hot: {:.6} ETH\n", hot_eth));
+
+        // Append full historical stats
+        msg.push_str("\n━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        msg.push_str(stats_summary);
+
+        self.send(&msg).await;
+    }
+
+    pub async fn notify_simulation_skip(
+        &self,
+        user: &str,
+        reason: &str,
+    ) {
+        let msg = format!(
+            "{} 🔍 Simulation skip\n\
+            👤 <code>{}</code>\n\
+            💭 {}",
+            self.bot_name, &user[..10], reason,
+        );
+        self.send(&msg).await;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // COLD WALLET SWEEP (standalone — for ETH sweeps)
+    // ─────────────────────────────────────────────────────────
+
+    pub async fn notify_eth_sweep(
+        &self,
+        amount_eth: f64,
+        hot_remaining_eth: f64,
+    ) {
+        let msg = format!(
+            "{} 💸 <b>ETH envoyé au cold wallet</b>\n\
+            \n\
+            　Envoyé: <b>{:.6} ETH</b>\n\
+            　Hot restant: {:.6} ETH",
+            self.bot_name, amount_eth, hot_remaining_eth,
+        );
+        self.send(&msg).await;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // ERRORS / ALERTS
+    // ─────────────────────────────────────────────────────────
+
+    pub async fn notify_error(&self, context: &str, error: &str) {
+        let msg = format!(
+            "{} 🚨 <b>Erreur</b>\n\
+            \n\
+            📍 {}\n\
+            ❗ <code>{}</code>",
+            self.bot_name, context, &error[..error.len().min(500)],
+        );
+        self.send(&msg).await;
+    }
+
+    pub async fn notify_low_eth(&self, balance_eth: f64) {
+        let msg = format!(
+            "{} ⛽ <b>ETH bas !</b>\n\
+            \n\
+            　Balance: <b>{:.6} ETH</b>\n\
+            　⚠️ Recharge le hot wallet !",
+            self.bot_name, balance_eth,
+        );
+        self.send(&msg).await;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DAILY SUMMARY (called by a scheduled task)
+    // ─────────────────────────────────────────────────────────
+
+    pub async fn notify_daily_summary(
+        &self,
+        uptime_hours: f64,
+        liquidations_today: u32,
+        profit_today: f64,
+        gas_today: f64,
+        total_liquidations: u32,
+        total_profit: f64,
+        users_tracked: usize,
+        at_risk: u32,
+        hot_eth: f64,
+    ) {
+        let msg = format!(
+            "{} 📋 <b>Résumé quotidien</b>\n\
+            \n\
+            ⏱️ Uptime: {:.1}h\n\
+            \n\
+            📊 <b>Aujourd'hui:</b>\n\
+            　Liquidations: {}\n\
+            　Profit: ${:.2}\n\
+            　Gas: -${:.4}\n\
+            　Net: <b>${:.2}</b>\n\
+            \n\
+            📊 <b>Total (session):</b>\n\
+            　Liquidations: {}\n\
+            　Profit: <b>${:.2}</b>\n\
+            \n\
+            👥 Users suivis: {}\n\
+            ⚠️ À risque: {}\n\
+            ⛽ Hot wallet: {:.6} ETH",
+            self.bot_name,
+            uptime_hours,
+            liquidations_today, profit_today, gas_today,
+            profit_today - gas_today,
+            total_liquidations, total_profit,
+            users_tracked, at_risk, hot_eth,
+        );
+        self.send(&msg).await;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // COMMAND HANDLER — polls for incoming /commands
+    // ─────────────────────────────────────────────────────────
+
+    /// Poll for incoming Telegram messages and respond to commands.
+    /// Runs in a separate tokio task, never blocks the main bot.
+    ///
+    /// Commands:
+    ///   /status  — is the bot alive, uptime, current state
+    ///   /stats   — full P&L summary
+    ///   /json    — sends stats.json as a document
+    ///   /help    — list commands
+    pub async fn run_command_listener(
+        self,
+        started_at: std::time::Instant,
+        stats_path: String,
+        // Shared state for live info
+        hot_wallet: String,
+        users_tracked: std::sync::Arc<tokio::sync::RwLock<usize>>,
+        at_risk_count: std::sync::Arc<tokio::sync::RwLock<u32>>,
+    ) {
+        // Separate client with long timeout for Telegram long-polling
+        let poll_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(330)) // 300s poll + 30s margin
+            .build()
+            .expect("poll client");
+
+        let mut last_update_id: i64 = 0;
+
+        // Get initial offset (skip old messages)
+        if let Some(id) = self.get_latest_update_id(&poll_client).await {
+            last_update_id = id + 1;
+        }
+
+        loop {
+            let updates = match self.get_updates(&poll_client, last_update_id).await {
+                Some(u) => u,
+                None => {
+                    // Network error — wait before retry
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    continue;
+                }
+            };
+
+            for update in updates {
+                let update_id = update["update_id"].as_i64().unwrap_or(0);
+                if update_id >= last_update_id {
+                    last_update_id = update_id + 1;
+                }
+
+                // Only respond to messages from our chat_id
+                let chat_id = update["message"]["chat"]["id"].to_string();
+                if chat_id.trim_matches('"') != self.chat_id {
+                    continue;
+                }
+
+                let text = update["message"]["text"].as_str().unwrap_or("");
+                let cmd = text.split_whitespace().next().unwrap_or("");
+
+                match cmd {
+                    "/status" | "/s" => {
+                        let uptime = started_at.elapsed();
+                        let hours = uptime.as_secs() / 3600;
+                        let mins = (uptime.as_secs() % 3600) / 60;
+                        let tracked = *users_tracked.read().await;
+                        let risk = *at_risk_count.read().await;
+
+                        // Load stats for quick numbers
+                        let stats = crate::stats::StatsStore::load();
+
+                        let msg = format!(
+                            "{} 🟢 <b>Bot is UP</b>\n\
+                            \n\
+                            ⏱️ Uptime: {}h {}min\n\
+                            🔑 Hot: <code>{}</code>\n\
+                            👥 Users suivis: {}\n\
+                            ⚠️ À risque: {}\n\
+                            ✅ Liquidations: {}\n\
+                            💰 Profit total: <b>${:.2}</b>",
+                            self.bot_name,
+                            hours, mins,
+                            &hot_wallet[..hot_wallet.len().min(10)],
+                            tracked, risk,
+                            stats.total_successes(),
+                            stats.total_profit() - stats.total_gas(),
+                        );
+                        self.send(&msg).await;
+                    }
+
+                    "/stats" | "/bilan" => {
+                        let stats = crate::stats::StatsStore::load();
+                        let summary = stats.format_summary();
+                        self.send(&summary).await;
+                    }
+
+                    "/json" | "/export" => {
+                        self.send_document(&stats_path).await;
+                    }
+
+                    "/help" | "/start" => {
+                        let msg = format!(
+                            "{} 📖 <b>Commandes</b>\n\
+                            \n\
+                            /status — état du bot (up/down, uptime)\n\
+                            /stats — bilan complet P&amp;L\n\
+                            /json — télécharger stats.json\n\
+                            /help — cette aide",
+                            self.bot_name,
+                        );
+                        self.send(&msg).await;
+                    }
+
+                    _ => {} // Ignore unknown
+                }
+            }
+        }
+    }
+
+    /// Get updates from Telegram using long-polling
+    /// One request hangs for up to 30s, returns instantly when a message arrives.
+    /// Result: ~1 HTTP request per 30s idle, instant response when you type a command.
+    async fn get_updates(&self, client: &reqwest::Client, offset: i64) -> Option<Vec<serde_json::Value>> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=300&allowed_updates=[\"message\"]",
+            self.token, offset
+        );
+        let resp = client.get(&url).send().await.ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        json["result"].as_array().cloned()
+    }
+
+    /// Get the latest update_id to skip old messages on startup
+    async fn get_latest_update_id(&self, client: &reqwest::Client) -> Option<i64> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/getUpdates?offset=-1",
+            self.token
+        );
+        let resp = client.get(&url).send().await.ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        json["result"].as_array()
+            .and_then(|arr| arr.last())
+            .and_then(|u| u["update_id"].as_i64())
+    }
+
+    /// Send a file as a Telegram document
+    async fn send_document(&self, file_path: &str) {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            self.send("❌ stats.json introuvable").await;
+            return;
+        }
+
+        let file_bytes = match tokio::fs::read(file_path).await {
+            Ok(b) => b,
+            Err(_) => {
+                self.send("❌ Erreur lecture stats.json").await;
+                return;
+            }
+        };
+
+        let url = format!("https://api.telegram.org/bot{}/sendDocument", self.token);
+
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.clone())
+            .text("caption", "📁 stats.json — historique complet")
+            .part("document", reqwest::multipart::Part::bytes(file_bytes)
+                .file_name("stats.json")
+                .mime_str("application/json")
+                .unwrap()
+            );
+
+        let _ = self.client.post(&url).multipart(form).send().await;
+    }
+}

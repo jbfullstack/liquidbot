@@ -1,0 +1,37 @@
+[package]
+name = "liquidator-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Ethereum
+alloy = { version = "0.15", features = [
+    "full",
+    "provider-ws",
+    "signer-local",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config
+dotenv = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utils
+eyre = "0.6"
+chrono = "0.4"
+dashmap = "6"          # concurrent hashmap for user index
+futures-util = "0.3"   # stream utilities for block subscription
+reqwest = { version = "0.12", features = ["json", "multipart"] }  # Telegram API
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
