@@ -463,7 +463,7 @@ impl TelegramNotifier {
                                 "{} 🔍 <b>{} positions à risque</b> (HF &lt; {:.2})\n",
                                 self.bot_name, list.len(), hf_threshold,
                             );
-                            msg.push_str("<pre>HF      Dette ($)    Adresse\n");
+                            msg.push_str("<pre>      HF      Dette      Adresse\n");
                             for (addr, hf, debt) in list.iter().take(30) {
                                 let danger = if *hf < 1.0 { "🔴" } else { "🟡" };
                                 let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
