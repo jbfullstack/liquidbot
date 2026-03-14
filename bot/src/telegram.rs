@@ -300,6 +300,7 @@ impl TelegramNotifier {
         bot_active: Arc<AtomicBool>,
         cmd_sender: tokio::sync::mpsc::Sender<TelegramCommand>,
         hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
+        hf_threshold: f64,
     ) {
         // Separate client with long timeout for Telegram long-polling
         let poll_client = reqwest::Client::builder()
@@ -396,20 +397,21 @@ impl TelegramNotifier {
                             self.send(&msg).await;
                         } else {
                             let mut msg = format!(
-                                "{} 🔍 <b>{} positions à risque</b> (HF &lt; seuil)\n\n\
-                                <code>HF      Dette       Adresse</code>\n",
-                                self.bot_name, list.len()
+                                "{} 🔍 <b>{} positions à risque</b> (HF &lt; {:.2})\n",
+                                self.bot_name, list.len(), hf_threshold,
                             );
+                            msg.push_str("<pre>HF      Dette ($)    Adresse\n");
                             for (addr, hf, debt) in list.iter().take(30) {
                                 let danger = if *hf < 1.0 { "🔴" } else { "🟡" };
+                                let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
                                 msg.push_str(&format!(
-                                    "{} {:.4}  ${:>10.2}  <code>{}…{}</code>\n",
-                                    danger, hf, debt,
-                                    &addr[..6], &addr[addr.len()-4..],
+                                    "{} {:.4}  {:>10.2} $  {}\n",
+                                    danger, hf, debt, short,
                                 ));
                             }
+                            msg.push_str("</pre>");
                             if list.len() > 30 {
-                                msg.push_str(&format!("\n<i>+{} autres non affichées</i>", list.len() - 30));
+                                msg.push_str(&format!("<i>+{} autres non affichées</i>", list.len() - 30));
                             }
                             self.send(&msg).await;
                         }

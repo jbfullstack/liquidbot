@@ -404,6 +404,7 @@ async fn main() -> Result<()> {
                 active_ref,
                 cmd_tx,
                 hf_ref,
+                cfg.health_factor_threshold,
             ).await;
         });
         tracing::info!("📱 Telegram commands: /status /stats /json /hf /help /stop_bot /start_bot /pause_contract /resume_contract");
