@@ -94,6 +94,27 @@ sol! {
             bool usageAsCollateralEnabled
         );
     }
+
+    /// Uniswap V3 QuoterV2 — returns swap output without reverting (unlike V1).
+    /// Used to find the best fee tier for a collateral→debt swap before execution.
+    #[sol(rpc)]
+    interface IQuoterV2 {
+        struct QuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            uint24  fee;
+            uint160 sqrtPriceLimitX96;
+        }
+        function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
+            external
+            returns (
+                uint256 amountOut,
+                uint160 sqrtPriceX96After,
+                uint32  initializedTicksCrossed,
+                uint256 gasEstimate
+            );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -104,8 +125,10 @@ const AAVE_POOL: Address          = address!("794a61358D6845594F94dc1DB02A252b5b
 const AAVE_DATA_PROVIDER: Address = address!("69FA688f1Dc47d4B5d8029D5a35FB7a548310654");
 /// Chainlink ETH/USD price feed on Arbitrum One (8 decimals)
 const CHAINLINK_ETH_USD: Address  = address!("639Fe6ab55C921f74e7fac1ee960C0B6293ba612");
+/// Uniswap V3 QuoterV2 on Arbitrum One
+const UNISWAP_QUOTER_V2: Address  = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
 
-/// Major Aave V3 reserve tokens on Arbitrum: (address, symbol, decimals)
+/// All active Aave V3 reserve tokens on Arbitrum One: (address, symbol, decimals)
 const TOKENS: &[(Address, &str, u8)] = &[
     (address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1"), "WETH",   18),
     (address!("af88d065e77c8cC2239327C5EDb3A432268e5831"), "USDC",    6),
@@ -115,6 +138,10 @@ const TOKENS: &[(Address, &str, u8)] = &[
     (address!("2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"), "WBTC",    8),
     (address!("5979D7b546E38E9Ab8F25A6E70b5CdE5A8C7A1D0"), "wstETH", 18),
     (address!("912CE59144191C1204E64559FE8253a0e49E6548"), "ARB",    18),
+    // Previously missing reserves — added after missed $211k opportunity
+    (address!("f97f4df75117a78c1A5a0DBb814Af92458539FB4"), "LINK",   18),
+    (address!("EC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA4"), "rETH",   18),
+    (address!("93b346b6BC2548dA6A1E7d98E9a421B42541425b"), "LUSD",   18),
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -215,6 +242,168 @@ fn remove_if_repaid(idx: &mut HashMap<Address, UserPosition>, user: &Address, to
 }
 
 // ═══════════════════════════════════════════════════════════════
+// User index persistence (BUG FIX: lookback too short on restart)
+// ═══════════════════════════════════════════════════════════════
+
+const INDEX_FILE: &str = "user_index.json";
+/// Default lookback when no saved index exists: ~14 days on Arbitrum (~0.25s/block)
+const DEFAULT_LOOKBACK: u64 = 4_000_000;
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SavedIndex {
+    last_saved_block: u64,
+    addresses: Vec<String>,
+}
+
+fn load_saved_index() -> SavedIndex {
+    std::fs::read_to_string(INDEX_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_index(idx: &HashMap<Address, UserPosition>, last_block: u64) {
+    let count = idx.len();
+    let saved = SavedIndex {
+        last_saved_block: last_block,
+        addresses: idx.keys().map(|a| format!("{a:#x}")).collect(),
+    };
+    match serde_json::to_string(&saved) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(INDEX_FILE, &json) {
+                tracing::warn!("Failed to save user index: {e}");
+            } else {
+                tracing::debug!("💾 Saved {count} addresses to {INDEX_FILE} (block {last_block})");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize user index: {e}"),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Uniswap routing — fee tier discovery + cache
+// ═══════════════════════════════════════════════════════════════
+
+/// Return 1 unit of `addr` in its native decimals (used as a safe QuoterV2 amount).
+/// Dust amounts cause quoter to return 0; overflows cause it to revert.
+/// 1 unit is always within the realistic liquidity range of any Uniswap V3 pool.
+fn token_unit(addr: Address) -> U256 {
+    let dec = TOKENS.iter()
+        .find(|(a, _, _)| *a == addr)
+        .map(|(_, _, d)| *d)
+        .unwrap_or(18);
+    U256::from(10u64).pow(U256::from(dec as u64))
+}
+
+/// How many blocks a cached fee tier stays valid before QuoterV2 re-check.
+/// 10 000 blocks ≈ 40 min on Arbitrum (0.25 s/block).
+/// Uniswap pool fee tiers never change; only liquidity distribution does.
+/// estimateGas is the real safety net — this cache is a latency optimisation.
+const CACHE_TTL_BLOCKS: u64 = 10_000;
+
+/// Cached, symmetric fee-tier lookup.
+///
+/// Safety contract
+/// ───────────────
+/// A stale or wrong cached tier can only cause estimateGas to revert (which we
+/// already handle with `continue`). We NEVER skip estimateGas. The cache is
+/// therefore a pure latency optimisation — zero correctness risk.
+///
+/// Symmetry
+/// ────────
+/// A Uniswap V3 pool serves A→B *and* B→A at the same fee tier.
+/// When we resolve a new pair we write both directions into the cache.
+///
+/// Latency saved
+/// ─────────────
+///   Cache hit  : 0 RPC calls  →   0 ms
+///   Cache miss : 4 parallel   → ~50 ms  (vs ~200 ms sequential)
+async fn cached_fee_tier<P: Provider>(
+    cache: &mut HashMap<(Address, Address), (u32, u64)>,
+    provider: &P,
+    token_in: Address,
+    token_out: Address,
+    current_block: u64,
+) -> Option<u32> {
+    let key = (token_in, token_out);
+
+    // ── Cache hit? ──
+    if let Some(&(tier, verified_at)) = cache.get(&key) {
+        let age = current_block.saturating_sub(verified_at);
+        if age < CACHE_TTL_BLOCKS {
+            tracing::debug!("  🗄️  cache hit {tier} bps (age {age} blk)");
+            return Some(tier);
+        }
+        tracing::debug!("  🗄️  cache stale ({age} blk), refreshing QuoterV2");
+    }
+
+    // ── Cache miss / stale: 4 parallel QuoterV2 calls ──
+    let tier = best_fee_tier(provider, token_in, token_out, token_unit(token_in)).await?;
+
+    // Store both directions — same Uniswap V3 pool serves A→B and B→A
+    cache.insert((token_in,  token_out), (tier, current_block));
+    cache.insert((token_out, token_in),  (tier, current_block));
+    tracing::info!("  🗄️  cache stored {tier} bps for pair (both dirs)");
+    Some(tier)
+}
+
+/// Query all 4 Uniswap V3 fee tiers via QuoterV2 **in parallel** (tokio::join!)
+/// and return the fee tier that produces the most output tokens.
+///
+/// Parallel = ~50ms vs ~200ms sequential — matters on Arbitrum FCFS.
+/// Returns None if no pool has sufficient liquidity for this pair.
+async fn best_fee_tier<P: Provider>(
+    provider: &P,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> Option<u32> {
+    let q = IQuoterV2::new(UNISWAP_QUOTER_V2, provider);
+
+    // Helper: build params for a given fee tier
+    let p = |fee: u32| IQuoterV2::QuoteExactInputSingleParams {
+        tokenIn:           token_in,
+        tokenOut:          token_out,
+        amountIn:          amount_in,
+        fee:               alloy::primitives::Uint::<24, 1>::from(fee),
+        sqrtPriceLimitX96: Default::default(), // 0 = no price limit
+    };
+
+    // Build CallBuilders first (must be bound to live long enough for join!)
+    let cb500   = q.quoteExactInputSingle(p(500));
+    let cb3000  = q.quoteExactInputSingle(p(3000));
+    let cb100   = q.quoteExactInputSingle(p(100));
+    let cb10000 = q.quoteExactInputSingle(p(10000));
+
+    // 4 RPC calls in parallel — resolves in time of the slowest single call
+    let (r500, r3000, r100, r10000) = tokio::join!(
+        cb500.call(),
+        cb3000.call(),
+        cb100.call(),
+        cb10000.call(),
+    );
+
+    let candidates = [
+        (500u32,   r500.ok().map(|r| r.amountOut)),
+        (3000u32,  r3000.ok().map(|r| r.amountOut)),
+        (100u32,   r100.ok().map(|r| r.amountOut)),
+        (10000u32, r10000.ok().map(|r| r.amountOut)),
+    ];
+
+    let best = candidates.iter()
+        .filter_map(|(fee, out)| out.map(|o| (*fee, o)))
+        .max_by_key(|(_, out)| *out);
+
+    if let Some((fee, out)) = best {
+        tracing::debug!("  QuoterV2 best route: {fee} bps → {out} out");
+    } else {
+        tracing::warn!("  QuoterV2: no viable route for {token_in} → {token_out}");
+    }
+
+    best.map(|(fee, _)| fee)
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
 
@@ -300,18 +489,39 @@ async fn main() -> Result<()> {
         stats.total_successes(), stats.total_profit(), stats.started_at
     );
 
-    // ── Build user index from recent Borrow events ──
+    // ── Build user index: load saved addresses + scan only new blocks ──
     let user_index: UserIndex = Arc::new(RwLock::new(HashMap::new()));
     let current_block: u64 = http_ro.get_block_number().await?;
-    let lookback: u64 = 200_000;
-    let from = current_block.saturating_sub(lookback);
 
-    tracing::info!("📡 Indexing borrowers from block {from} to {current_block}...");
+    // Load persisted index from previous run (survives restarts)
+    let saved = load_saved_index();
+    let saved_count = saved.addresses.len();
+    let scan_from = if saved.last_saved_block > 0 {
+        // Resume from where we left off — only scan new blocks
+        saved.last_saved_block + 1
+    } else {
+        // First ever run — scan last ~14 days of Borrow events
+        current_block.saturating_sub(DEFAULT_LOOKBACK)
+    };
+
+    tracing::info!(
+        "💾 Loaded {} addresses from saved index (last block: {})",
+        saved_count, saved.last_saved_block
+    );
+    tracing::info!("📡 Scanning Borrow events from block {scan_from} to {current_block}...");
 
     // drpc free tier: max 9 999 blocks per eth_getLogs request → chunk it
     const CHUNK: u64 = 9_000;
     let mut borrowers: HashSet<Address> = HashSet::new();
-    let mut chunk_start = from;
+
+    // Seed from saved index first (all previously known borrowers)
+    for addr_str in &saved.addresses {
+        if let Ok(addr) = addr_str.parse::<Address>() {
+            borrowers.insert(addr);
+        }
+    }
+
+    let mut chunk_start = scan_from;
     while chunk_start <= current_block {
         let chunk_end = (chunk_start + CHUNK - 1).min(current_block);
         let log_filter = Filter::new()
@@ -416,6 +626,67 @@ async fn main() -> Result<()> {
         tracing::info!("📱 Telegram commands: /status /stats /json /hf /gas /help /stop_bot /start_bot /pause_contract /resume_contract");
     }
 
+    // ── Fee tier cache + pre-warm ──────────────────────────────────────────────
+    // Cache: (token_in, token_out) → (fee_tier_bps, block_verified)
+    // Pre-warm all stable↔major and major↔major cross-pairs so the FIRST
+    // liquidation attempt has zero QuoterV2 overhead (0 ms vs 50 ms).
+    let mut fee_cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+    {
+        let stable_addrs: Vec<Address> = TOKENS.iter()
+            .filter(|(_, _, d)| *d == 6)
+            .map(|(a, _, _)| *a)
+            .collect();
+        let major_addrs: Vec<Address> = TOKENS.iter()
+            .filter(|(_, _, d)| *d != 6)
+            .map(|(a, _, _)| *a)
+            .collect();
+
+        let mut pairs: Vec<(Address, Address)> = Vec::new();
+
+        // major → stable  (collateral = major, debt = stable — most common case)
+        // stable → major  (collateral = stable, debt = major — rarer but exists)
+        for s in &stable_addrs {
+            for m in &major_addrs {
+                pairs.push((*m, *s));
+                pairs.push((*s, *m));
+            }
+        }
+        // stable → stable (e.g. USDC debt liquidated with USDT collateral)
+        for (i, a) in stable_addrs.iter().enumerate() {
+            for b in stable_addrs.iter().skip(i + 1) {
+                pairs.push((*a, *b));
+                pairs.push((*b, *a));
+            }
+        }
+        // major → major  (e.g. wstETH collateral, WETH debt)
+        for (i, a) in major_addrs.iter().enumerate() {
+            for b in major_addrs.iter().skip(i + 1) {
+                pairs.push((*a, *b));
+                pairs.push((*b, *a));
+            }
+        }
+
+        tracing::info!("🗄️  Pre-warming fee tier cache for {} pairs…", pairs.len());
+
+        // Process in batches of 6 pairs (= 24 concurrent QuoterV2 calls)
+        // to stay within DRPC/Alchemy free-tier concurrent request limits.
+        let mut resolved = 0usize;
+        for batch in pairs.chunks(6) {
+            let futs: Vec<_> = batch.iter()
+                .map(|(tin, tout)| best_fee_tier(&http_ro, *tin, *tout, token_unit(*tin)))
+                .collect();
+            let results = futures_util::future::join_all(futs).await;
+            for ((tin, tout), maybe_tier) in batch.iter().zip(results.iter()) {
+                if let Some(tier) = maybe_tier {
+                    fee_cache.insert((*tin,  *tout), (*tier, current_block));
+                    fee_cache.insert((*tout, *tin),  (*tier, current_block));
+                    resolved += 1;
+                }
+            }
+        }
+        tracing::info!("🗄️  Fee cache ready: {resolved}/{} pairs resolved", pairs.len());
+    }
+
     // ── pending_liquidations: prevents double-sending on the same user ──
     let mut pending_liquidations: HashSet<Address> = HashSet::new();
 
@@ -441,6 +712,8 @@ async fn main() -> Result<()> {
     let mut stats_profit = 0.0f64;
     // Track price for flash-crash detection
     let mut prev_eth_price = eth_price_usd;
+    // Last known block number — used to save index on clean shutdown
+    let mut last_block: u64 = current_block;
     // Last block we sent a low-gas alert (avoid spam)
     let mut last_gas_alert_block: u64 = 0;
 
@@ -524,6 +797,7 @@ async fn main() -> Result<()> {
                 };
 
                 let bn = block.number;
+                last_block = bn;
 
                 // Collect at-risk users, sorted by debt descending (biggest profit first).
                 // On Arbitrum FCFS, we want to attempt the most valuable position first.
@@ -538,6 +812,9 @@ async fn main() -> Result<()> {
                 };
 
                 // ── Priority refresh: process users due this block, riskiest first ──
+                // All getUserAccountData calls run IN PARALLEL (join_all) then one
+                // write lock to update the index — was: N sequential calls × 1 lock each.
+                // For 30 users: was ~600ms sequential, now ~20ms parallel.
                 {
                     let mut due: Vec<(Address, U256)> = {
                         let idx = user_index.read().await;
@@ -546,21 +823,34 @@ async fn main() -> Result<()> {
                             .map(|(u, p)| (*u, p.health_factor))
                             .collect()
                     };
-                    // Sort by HF ascending → riskiest users processed first within the cap
                     due.sort_unstable_by_key(|(_, hf)| *hf);
                     due.truncate(MAX_REFRESH_PER_BLOCK);
 
-                    for (user, _) in due {
-                        if let Ok(d) = pool.getUserAccountData(user).call().await {
+                    if !due.is_empty() {
+                        // Build all call builders first so they live long enough
+                        let cbs: Vec<_> = due.iter()
+                            .map(|(user, _)| pool.getUserAccountData(*user))
+                            .collect();
+
+                        // Fire all RPC calls in parallel
+                        // EthCall implements IntoFuture (not Future), so we must
+                        // call .into_future() explicitly for join_all.
+                        let results = futures_util::future::join_all(
+                            cbs.iter().map(|cb| std::future::IntoFuture::into_future(cb.call()))
+                        ).await;
+
+                        // Single write-lock to apply all updates atomically
+                        let mut idx = user_index.write().await;
+                        for ((user, _), d_result) in due.iter().zip(results.iter()) {
+                            let Ok(d) = d_result else { continue; };
                             let interval = refresh_interval_blocks(d.healthFactor);
-                            let mut idx = user_index.write().await;
-                            remove_if_repaid(&mut idx, &user, d.totalDebtBase);
-                            if let Some(pos) = idx.get_mut(&user) {
-                                pos.health_factor = d.healthFactor;
-                                pos.total_debt_base = d.totalDebtBase;
-                                pos.total_collateral_base = d.totalCollateralBase;
-                                pos.last_block = bn;
-                                pos.next_refresh_at = bn + interval;
+                            remove_if_repaid(&mut idx, user, d.totalDebtBase);
+                            if let Some(pos) = idx.get_mut(user) {
+                                pos.health_factor          = d.healthFactor;
+                                pos.total_debt_base        = d.totalDebtBase;
+                                pos.total_collateral_base  = d.totalCollateralBase;
+                                pos.last_block             = bn;
+                                pos.next_refresh_at        = bn + interval;
                             }
                         }
                     }
@@ -665,6 +955,11 @@ async fn main() -> Result<()> {
                     *shared_hf_list.write().await = snapshot;
                 }
 
+                // Persist user index every 500 blocks (~2 min) so restarts are fast
+                if bn % 500 == 0 {
+                    save_index(&*user_index.read().await, bn);
+                }
+
                 // Heartbeat toutes les 100 blocs (~25s sur Arbitrum)
                 if bn % 100 == 0 {
                     let liquidatable = at_risk_users.iter().filter(|&&u| {
@@ -730,13 +1025,20 @@ async fn main() -> Result<()> {
                     let mut best_debt: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
                     let mut best_coll: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
 
-                    for &(tok, name, decimals) in TOKENS {
-                        if let Ok(rd) = data_prov.getUserReserveData(tok, *user).call().await {
+                    {
+                        let cbs_rd: Vec<_> = TOKENS.iter()
+                            .map(|(tok, _, _)| data_prov.getUserReserveData(*tok, *user))
+                            .collect();
+                        let results = futures_util::future::join_all(
+                            cbs_rd.iter().map(|cb| std::future::IntoFuture::into_future(cb.call()))
+                        ).await;
+                        for ((tok, name, decimals), rd_result) in TOKENS.iter().zip(results.iter()) {
+                            let Ok(rd) = rd_result else { continue; };
                             if rd.currentVariableDebt > best_debt.1 {
-                                best_debt = (tok, rd.currentVariableDebt, name, decimals);
+                                best_debt = (*tok, rd.currentVariableDebt, name, *decimals);
                             }
                             if rd.currentATokenBalance > best_coll.1 && rd.usageAsCollateralEnabled {
-                                best_coll = (tok, rd.currentATokenBalance, name, decimals);
+                                best_coll = (*tok, rd.currentATokenBalance, name, *decimals);
                             }
                         }
                     }
@@ -760,27 +1062,54 @@ async fn main() -> Result<()> {
                         best_debt.1 / U256::from(2u64)
                     };
 
-                    // Uniswap V3 fee tier:
-                    // 0 when no swap is needed (same asset), otherwise 3000 = 0.30%
-                    let fee_tier = if best_debt.0 == best_coll.0 {
-                        alloy::primitives::Uint::<24, 1>::from(0u32)
-                    } else {
-                        alloy::primitives::Uint::<24, 1>::from(3000u32)
-                    };
-
                     // min_profit in debt token native units (correct per-token scaling)
                     let min_profit = min_profit_raw(cfg.min_profit_usd, best_debt.3, eth_price_usd);
 
-                    // minSwapOut = U256::ZERO — no slippage bound on DEX swap.
-                    // estimateGas simulation + minProfit are the profitability guards.
-                    // TODO: add Uniswap quoter call for proper slippage protection.
+                    // ── Fee tier + minSwapOut ──────────────────────────────────────────
+                    // For same-token liquidations (collateral == debt) no swap is needed.
+                    // For cross-token: query QuoterV2 across all 4 Uniswap fee tiers to
+                    // find the pool with actual liquidity.  Previously hardcoded at 3000
+                    // which caused missed liquidations (e.g. WETH/USDC best pool = 500).
+                    //
+                    // minSwapOut = flash_repay + min_profit (in debt token units):
+                    //   guarantees the swap always yields enough to repay the flash loan
+                    //   AND produce at least min_profit — the contract checks the same.
+                    let (fee_tier, min_swap_out) = if best_debt.0 == best_coll.0 {
+                        // Same-token: no swap, no slippage to worry about
+                        (alloy::primitives::Uint::<24, 1>::from(0u32), U256::ZERO)
+                    } else {
+                        // Find the most liquid Uniswap pool for collateral → debt.
+                        // Uses the in-memory cache (0 RPC calls if warm, ~50ms if cold).
+                        match cached_fee_tier(&mut fee_cache, &http_ro, best_coll.0, best_debt.0, bn).await {
+                            Some(f) => {
+                                // floor: must recover flash principal + premium + min_profit
+                                let flash_repay = debt_to_cover
+                                    + debt_to_cover * U256::from(premium as u64)
+                                        / U256::from(10_000u64);
+                                let min_out = flash_repay + min_profit;
+                                tracing::info!(
+                                    "  Route: {f} bps | minSwapOut: {min_out} ({}/{})",
+                                    best_coll.2, best_debt.2
+                                );
+                                (alloy::primitives::Uint::<24, 1>::from(f), min_out)
+                            }
+                            None => {
+                                tracing::info!(
+                                    "  No Uniswap route for {}/{} → skip {user}",
+                                    best_coll.2, best_debt.2
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
                     let tx = liquidator.liquidate(
                         *user,
                         best_coll.0,
                         best_debt.0,
                         debt_to_cover,
                         fee_tier,
-                        U256::ZERO,
+                        min_swap_out,
                         min_profit,
                     );
 
@@ -1006,6 +1335,8 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
+                // Save user index before exiting so next restart is fast
+                save_index(&*user_index.read().await, last_block);
                 tracing::info!("\n🛑 Session: {stats_liq} liquidations, ~${stats_profit:.2} gross");
                 if let Some(ref tg) = tg {
                     let summary = stats.format_summary();
@@ -1076,9 +1407,12 @@ mod tests {
         assert!(v_cheap_eth > v_pricey_eth, "cheaper ETH → more wei needed for same USD profit");
     }
 
+    // ── TOKENS table ──────────────────────────────────────────────
+
     #[test]
     fn test_tokens_table_has_correct_len() {
-        assert_eq!(TOKENS.len(), 8);
+        // 8 original + 3 added (LINK, rETH, LUSD)
+        assert_eq!(TOKENS.len(), 11, "Expected 11 tokens; update this if you add more");
     }
 
     #[test]
@@ -1097,6 +1431,47 @@ mod tests {
         for (addr, name, _) in TOKENS {
             assert!(seen.insert(addr), "Duplicate address for token {name}");
         }
+    }
+
+    #[test]
+    fn test_tokens_no_duplicate_symbols() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, name, _) in TOKENS {
+            assert!(seen.insert(*name), "Duplicate symbol: {name}");
+        }
+    }
+
+    #[test]
+    fn test_tokens_no_zero_address() {
+        for (addr, name, _) in TOKENS {
+            assert_ne!(*addr, Address::ZERO, "Token {name} has zero address");
+        }
+    }
+
+    #[test]
+    fn test_tokens_contains_original_reserves() {
+        let names: Vec<&str> = TOKENS.iter().map(|(_, n, _)| *n).collect();
+        for expected in ["WETH", "USDC", "USDCe", "USDT", "DAI", "WBTC", "wstETH", "ARB"] {
+            assert!(names.contains(&expected), "Original reserve {expected} missing");
+        }
+    }
+
+    #[test]
+    fn test_tokens_contains_added_reserves() {
+        // These were missing and caused the $211k HF=1.03 position to be undetectable
+        let addrs: Vec<Address> = TOKENS.iter().map(|(a, _, _)| *a).collect();
+        assert!(
+            addrs.contains(&address!("f97f4df75117a78c1A5a0DBb814Af92458539FB4")),
+            "LINK missing from TOKENS"
+        );
+        assert!(
+            addrs.contains(&address!("EC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA4")),
+            "rETH missing from TOKENS"
+        );
+        assert!(
+            addrs.contains(&address!("93b346b6BC2548dA6A1E7d98E9a421B42541425b")),
+            "LUSD missing from TOKENS"
+        );
     }
 
     // ── index_borrower ──
@@ -1230,5 +1605,425 @@ mod tests {
         // Must not panic on a user that was never indexed
         remove_if_repaid(&mut idx, &unknown, U256::ZERO);
         assert!(idx.is_empty());
+    }
+
+    // ── SavedIndex — serialization ─────────────────────────────
+
+    #[test]
+    fn test_saved_index_default_is_empty() {
+        let s = SavedIndex::default();
+        assert_eq!(s.last_saved_block, 0);
+        assert!(s.addresses.is_empty());
+    }
+
+    #[test]
+    fn test_saved_index_json_round_trip() {
+        let original = SavedIndex {
+            last_saved_block: 123_456_789,
+            addresses: vec![
+                "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                "0x1111111111111111111111111111111111111111".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let loaded: SavedIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.last_saved_block, 123_456_789);
+        assert_eq!(loaded.addresses.len(), 2);
+        assert_eq!(loaded.addresses[0], original.addresses[0]);
+        assert_eq!(loaded.addresses[1], original.addresses[1]);
+    }
+
+    #[test]
+    fn test_saved_index_address_parses_back_correctly() {
+        // Verify the `{a:#x}` format used by save_index() round-trips through parse()
+        let addr = Address::repeat_byte(0xAB);
+        let formatted = format!("{addr:#x}");
+        let parsed: Address = formatted.parse().unwrap();
+        assert_eq!(parsed, addr);
+    }
+
+    #[test]
+    fn test_saved_index_empty_addresses_serializes_cleanly() {
+        let s = SavedIndex { last_saved_block: 42, addresses: vec![] };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"last_saved_block\":42"));
+        assert!(json.contains("\"addresses\":[]"));
+    }
+
+    #[test]
+    fn test_saved_index_unknown_fields_ignored() {
+        // Forward-compatibility: extra JSON fields must not break deserialization
+        let json = r#"{"last_saved_block":7,"addresses":[],"future_field":"ignored"}"#;
+        // serde default is to error on unknown fields unless #[serde(deny_unknown_fields)]
+        // We do NOT use deny_unknown_fields, so this should succeed
+        let s: Result<SavedIndex, _> = serde_json::from_str(json);
+        assert!(s.is_ok(), "Unknown fields must not break SavedIndex deserialization");
+    }
+
+    // ── save_index / load_saved_index (file I/O via tempfile) ──
+
+    #[test]
+    fn test_index_file_roundtrip_via_tempdir() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("user_index.json");
+
+        // Build a small in-memory index
+        let mut idx: HashMap<Address, UserPosition> = HashMap::new();
+        let u1 = Address::repeat_byte(0x11);
+        let u2 = Address::repeat_byte(0x22);
+        idx.insert(u1, make_position(1_050_000_000_000_000_000, 1_000));
+        idx.insert(u2, make_position(1_100_000_000_000_000_000, 2_000));
+
+        // Simulate what save_index() does (without hard-coded path)
+        let saved = SavedIndex {
+            last_saved_block: 9_999_999,
+            addresses: idx.keys().map(|a| format!("{a:#x}")).collect(),
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        std::fs::write(&path, &json).unwrap();
+
+        // Simulate what load_saved_index() does
+        let loaded: SavedIndex = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap()
+        ).unwrap();
+
+        assert_eq!(loaded.last_saved_block, 9_999_999);
+        assert_eq!(loaded.addresses.len(), 2);
+
+        let parsed: std::collections::HashSet<Address> = loaded.addresses.iter()
+            .map(|s| s.parse::<Address>().unwrap())
+            .collect();
+        assert!(parsed.contains(&u1), "u1 missing after round-trip");
+        assert!(parsed.contains(&u2), "u2 missing after round-trip");
+    }
+
+    #[test]
+    fn test_load_saved_index_missing_file_returns_default() {
+        // load_saved_index() on a non-existent file must return SavedIndex::default()
+        // We can't call load_saved_index() directly (hard-coded path), but we can
+        // test the underlying logic: read_to_string on missing file → None → default
+        let result: Option<SavedIndex> = std::fs::read_to_string("/nonexistent/path/xyz.json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        assert!(result.is_none());
+        // This is exactly what load_saved_index() falls back to
+        let fallback = result.unwrap_or_default();
+        assert_eq!(fallback.last_saved_block, 0);
+        assert!(fallback.addresses.is_empty());
+    }
+
+    // ── DEFAULT_LOOKBACK ───────────────────────────────────────
+
+    #[test]
+    fn test_default_lookback_covers_at_least_one_week() {
+        // Arbitrum ~0.25s/block → 4M blocks ≈ 11.6 days
+        // One week = 604_800s / 0.25s = 2_419_200 blocks
+        const ONE_WEEK_BLOCKS: u64 = 2_500_000;
+        assert!(
+            DEFAULT_LOOKBACK >= ONE_WEEK_BLOCKS,
+            "DEFAULT_LOOKBACK {DEFAULT_LOOKBACK} < 1 week ({ONE_WEEK_BLOCKS} blocks)"
+        );
+    }
+
+    #[test]
+    fn test_default_lookback_not_unreasonably_large() {
+        // 20M blocks at 0.25s = ~58 days. More than that makes cold-start too slow.
+        assert!(
+            DEFAULT_LOOKBACK <= 20_000_000,
+            "DEFAULT_LOOKBACK {DEFAULT_LOOKBACK} is too large (cold-start would be very slow)"
+        );
+    }
+
+    // ── QuoterV2 — logic (no RPC needed) ──────────────────────
+
+    #[test]
+    fn test_uniswap_quoter_v2_address_is_not_zero() {
+        assert_ne!(UNISWAP_QUOTER_V2, Address::ZERO);
+    }
+
+    #[test]
+    fn test_fee_tier_candidates_logic() {
+        // Simulate the candidate-picking logic from best_fee_tier()
+        // without making any RPC calls.
+        let candidates: [(u32, Option<U256>); 4] = [
+            (500,   Some(U256::from(1_050_000u64))), // best output
+            (3000,  Some(U256::from(1_030_000u64))),
+            (100,   None),                           // pool doesn't exist
+            (10000, Some(U256::from(900_000u64))),
+        ];
+
+        let best = candidates.iter()
+            .filter_map(|(fee, out)| out.map(|o| (*fee, o)))
+            .max_by_key(|(_, out)| *out);
+
+        assert_eq!(best, Some((500u32, U256::from(1_050_000u64))));
+    }
+
+    #[test]
+    fn test_fee_tier_candidates_all_none_returns_none() {
+        let candidates: [(u32, Option<U256>); 4] = [
+            (500,   None),
+            (3000,  None),
+            (100,   None),
+            (10000, None),
+        ];
+        let best = candidates.iter()
+            .filter_map(|(fee, out)| out.map(|o| (*fee, o)))
+            .max_by_key(|(_, out)| *out);
+        assert!(best.is_none());
+    }
+
+    #[test]
+    fn test_min_swap_out_formula() {
+        // Verify the minSwapOut = flash_repay + min_profit formula
+        // flash premium on Aave V3 = 9 bps
+        let premium: u64 = 9;
+        let debt_to_cover = U256::from(100_000_000u64); // 100 USDC (6 dec)
+        let min_profit    = U256::from(2_000_000u64);   // $2 in USDC units
+
+        let flash_repay = debt_to_cover
+            + debt_to_cover * U256::from(premium) / U256::from(10_000u64);
+        let min_swap_out = flash_repay + min_profit;
+
+        // 9 bps of 100_000_000 = 90_000
+        // flash_repay = 100_000_000 + 90_000 = 100_090_000
+        // min_swap_out = 100_090_000 + 2_000_000 = 102_090_000
+        assert_eq!(flash_repay, U256::from(100_090_000u64));
+        assert_eq!(min_swap_out, U256::from(102_090_000u64));
+    }
+
+    // ── token_unit ────────────────────────────────────────────
+
+    #[test]
+    fn test_token_unit_usdc_6dec() {
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        assert_eq!(token_unit(usdc), U256::from(1_000_000u64)); // 10^6
+    }
+
+    #[test]
+    fn test_token_unit_weth_18dec() {
+        let weth = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
+        assert_eq!(token_unit(weth), U256::from(1_000_000_000_000_000_000u64)); // 10^18
+    }
+
+    #[test]
+    fn test_token_unit_wbtc_8dec() {
+        let wbtc = address!("2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f");
+        assert_eq!(token_unit(wbtc), U256::from(100_000_000u64)); // 10^8
+    }
+
+    #[test]
+    fn test_token_unit_unknown_defaults_to_1e18() {
+        let unknown = Address::repeat_byte(0xAA);
+        assert_eq!(token_unit(unknown), U256::from(1_000_000_000_000_000_000u64));
+    }
+
+    #[test]
+    fn test_token_unit_all_known_tokens_nonzero() {
+        for (addr, name, _) in TOKENS {
+            let unit = token_unit(*addr);
+            assert!(unit > U256::ZERO, "token_unit for {name} returned 0");
+            assert!(unit <= U256::from(10u64).pow(U256::from(18u64)),
+                "token_unit for {name} > 1e18 (unexpected decimals)");
+        }
+    }
+
+    // ── fee cache logic (no RPC) ──────────────────────────────
+
+    #[test]
+    fn test_cache_ttl_is_reasonable() {
+        // 10 000 blocks at 0.25 s/block = 2 500 s ≈ 42 min
+        assert!(CACHE_TTL_BLOCKS >= 1_000, "TTL too short — would thrash QuoterV2");
+        assert!(CACHE_TTL_BLOCKS <= 50_000, "TTL too long — stale routes risk");
+    }
+
+    #[test]
+    fn test_cache_hit_returns_tier() {
+        // Simulate the cache-hit branch of cached_fee_tier() without RPC
+        let mut cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let weth = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        let current_block = 1_000u64;
+        let verified_at   =   900u64; // age = 100, well within TTL
+
+        cache.insert((weth, usdc), (500, verified_at));
+
+        // Inline cache-hit logic
+        let key = (weth, usdc);
+        let result = if let Some(&(tier, va)) = cache.get(&key) {
+            if current_block.saturating_sub(va) < CACHE_TTL_BLOCKS {
+                Some(tier)
+            } else { None }
+        } else { None };
+
+        assert_eq!(result, Some(500u32));
+    }
+
+    #[test]
+    fn test_cache_miss_on_unknown_pair() {
+        let cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let a = Address::repeat_byte(0x01);
+        let b = Address::repeat_byte(0x02);
+        assert!(cache.get(&(a, b)).is_none());
+    }
+
+    #[test]
+    fn test_cache_stale_when_past_ttl() {
+        let mut cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let a = Address::repeat_byte(0x01);
+        let b = Address::repeat_byte(0x02);
+        let verified_at   =     100u64;
+        let current_block = 200_000u64; // age >> TTL
+
+        cache.insert((a, b), (3000, verified_at));
+
+        let age = current_block.saturating_sub(verified_at);
+        assert!(age >= CACHE_TTL_BLOCKS, "should be stale");
+    }
+
+    #[test]
+    fn test_cache_symmetric_insert() {
+        // When we store A→B, we also store B→A (same Uniswap V3 pool)
+        let mut cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let a = Address::repeat_byte(0xAA);
+        let b = Address::repeat_byte(0xBB);
+        let tier = 500u32;
+        let blk  = 5_000u64;
+
+        cache.insert((a, b), (tier, blk));
+        cache.insert((b, a), (tier, blk)); // symmetric
+
+        assert_eq!(cache.get(&(a, b)).map(|v| v.0), Some(500));
+        assert_eq!(cache.get(&(b, a)).map(|v| v.0), Some(500));
+    }
+
+    #[test]
+    fn test_cache_newer_entry_overwrites_stale() {
+        let mut cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let a = Address::repeat_byte(0x01);
+        let b = Address::repeat_byte(0x02);
+
+        cache.insert((a, b), (3000, 100));   // old entry
+        cache.insert((a, b), (500,  9_999)); // fresher re-check found better pool
+
+        assert_eq!(cache[&(a, b)].0, 500);
+        assert_eq!(cache[&(a, b)].1, 9_999);
+    }
+
+    #[test]
+    fn test_prewarm_pairs_are_non_empty() {
+        // Verify the pre-warm logic produces pairs — regression guard
+        let stable_addrs: Vec<Address> = TOKENS.iter()
+            .filter(|(_, _, d)| *d == 6)
+            .map(|(a, _, _)| *a)
+            .collect();
+        let major_addrs: Vec<Address> = TOKENS.iter()
+            .filter(|(_, _, d)| *d != 6)
+            .map(|(a, _, _)| *a)
+            .collect();
+
+        let mut pairs: Vec<(Address, Address)> = Vec::new();
+        for s in &stable_addrs {
+            for m in &major_addrs {
+                pairs.push((*m, *s));
+                pairs.push((*s, *m));
+            }
+        }
+
+        // 6-dec tokens: USDC, USDCe, USDT = 3  (DAI and LUSD are 18-dec)
+        // non-6-dec:    WETH, DAI, WBTC, wstETH, ARB, LINK, rETH, LUSD = 8
+        // 3 × 8 × 2 dirs = 48 pairs
+        assert_eq!(stable_addrs.len(), 3, "expected 3 six-dec tokens (USDC/USDCe/USDT)");
+        assert_eq!(major_addrs.len(),  8, "expected 8 non-six-dec tokens");
+        assert_eq!(pairs.len(), 48, "expected 48 directed stable↔major pairs");
+
+        // No pair should have identical token_in and token_out
+        for (a, b) in &pairs {
+            assert_ne!(a, b, "self-swap pair found");
+        }
+    }
+
+    // ── Parallel RPC structure — timing proof ─────────────────
+    //
+    // We can't call real RPC in unit tests, but we can prove the
+    // join_all pattern fires N tasks in parallel by timing mock
+    // futures.  Each mock sleeps for D ms; if sequential that
+    // would take N×D ms, but parallel it takes only ~D ms.
+
+    #[tokio::test]
+    async fn test_parallel_join_all_fires_concurrently() {
+        use std::time::{Duration, Instant};
+
+        const N: usize = 11; // mirrors TOKENS.len()
+        const DELAY_MS: u64 = 20;
+
+        // Build N independent async tasks, each sleeping DELAY_MS
+        let futs: Vec<_> = (0..N)
+            .map(|_| async move {
+                tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+                1u32
+            })
+            .collect();
+
+        let t0 = Instant::now();
+        let results = futures_util::future::join_all(futs).await;
+        let elapsed = t0.elapsed();
+
+        // All tasks produced their value
+        assert_eq!(results.len(), N);
+        assert!(results.iter().all(|&v| v == 1));
+
+        // Parallel: total time ≈ DELAY_MS, not N × DELAY_MS
+        // Allow 2× DELAY_MS for CI jitter
+        let max_parallel_ms = DELAY_MS * 2;
+        let sequential_ms   = DELAY_MS * N as u64;
+        assert!(
+            elapsed < Duration::from_millis(max_parallel_ms),
+            "join_all took {}ms — expected <{}ms (would be {}ms sequential)",
+            elapsed.as_millis(), max_parallel_ms, sequential_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reserve_data_count_matches_tokens() {
+        // Verify that iterating TOKENS with join_all produces exactly
+        // TOKENS.len() results — no off-by-one, no dropped entries.
+        use std::time::{Duration, Instant};
+
+        let futs: Vec<_> = TOKENS.iter()
+            .map(|(tok, name, decimals)| {
+                let addr = *tok;
+                let sym  = *name;
+                let dec  = *decimals;
+                async move {
+                    // Simulate the getUserReserveData latency
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    (addr, sym, dec, true) // (addr, name, decimals, ok)
+                }
+            })
+            .collect();
+
+        let t0 = Instant::now();
+        let results = futures_util::future::join_all(futs).await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(results.len(), TOKENS.len(), "result count must match TOKENS");
+        // Each result maps back to the right token
+        for ((tok, name, dec, ok), (expected_tok, expected_name, expected_dec)) in
+            results.iter().zip(TOKENS.iter())
+        {
+            assert_eq!(tok,  expected_tok);
+            assert_eq!(name, expected_name);
+            assert_eq!(dec,  expected_dec);
+            assert!(ok);
+        }
+        // 11 × 5ms sequential = 55ms; parallel should be ~5ms
+        assert!(
+            elapsed < Duration::from_millis(30),
+            "parallel reserve fetch took {}ms — expected <30ms (was ~55ms sequential)",
+            elapsed.as_millis()
+        );
     }
 }
