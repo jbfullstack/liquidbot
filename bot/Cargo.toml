@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Ethereum
-alloy = { version = "0.15", features = [
+alloy = { version = "1", features = [
     "full",
     "provider-ws",
     "signer-local",
@@ -26,12 +26,18 @@ serde_json = "1"
 # Utils
 eyre = "0.6"
 chrono = "0.4"
-dashmap = "6"          # concurrent hashmap for user index
-futures-util = "0.3"   # stream utilities for block subscription
-reqwest = { version = "0.12", features = ["json", "multipart"] }  # Telegram API
+dashmap = "6"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+

@@ -116,6 +116,8 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
     error NothingToRescue();
     error Reentrancy();
     error NotProfitable(uint256 received, uint256 owed);
+    error NotInFlashLoan();
+    error InvalidAsset();
 
     // ── Immutables ──
     address public immutable owner;
@@ -126,13 +128,13 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
 
     // ── Storage ──
     bool public paused;
-    uint8 private _locked;
+    uint8 private _locked = 1; // 1 = unlocked, 2 = locked (1/2 pattern avoids cold SSTORE cost)
 
     // ── Modifiers ──
     modifier onlyOwner()    { if (msg.sender != owner) revert NotOwner(); _; }
     modifier notPaused()    { if (paused) revert Paused(); _; }
     modifier onlyAavePool() { if (msg.sender != address(aavePool)) revert NotAavePool(); _; }
-    modifier nonReentrant() { if (_locked == 1) revert Reentrancy(); _locked = 1; _; _locked = 0; }
+    modifier nonReentrant() { if (_locked == 2) revert Reentrancy(); _locked = 2; _; _locked = 1; }
 
     // ── Struct for callback params ──
     struct LiqParams {
@@ -204,8 +206,10 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
             0
         );
 
-        // After flash loan callback completes, sweep all profits
-        _sweepAll(collateralAsset);
+        // After flash loan callback completes, sweep all profits.
+        // Sweep collateral first (dust in cross-token case), then debt asset (the profit).
+        // Skip collateral sweep when same-token to avoid a redundant zero-balance call.
+        if (collateralAsset != debtAsset) _sweepAll(collateralAsset);
         _sweepAll(debtAsset);
     }
 
@@ -220,6 +224,7 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         address initiator,
         bytes calldata params
     ) external override onlyAavePool returns (bool) {
+        if (_locked != 2) revert NotInFlashLoan(); // must be inside our own flash loan call stack
         if (initiator != address(this)) revert NotSelf();
         return _doLiquidation(asset, amount, premium, params);
     }
@@ -231,6 +236,7 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         bytes calldata params
     ) internal returns (bool) {
         LiqParams memory p = abi.decode(params, (LiqParams));
+        if (asset != p.debtAsset) revert InvalidAsset();
 
         uint256 totalDebt = amount + premium;
 
@@ -247,10 +253,11 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
             false
         );
 
-        // Step 3: If collateral != debt, swap collateral → debt token
-        uint256 collateralReceived = 0;
+        // Step 3: handle collateral — swap to debt token if different assets
+        uint256 collateralReceived;
         uint256 debtBalance;
         if (p.collateralAsset != p.debtAsset) {
+            // Cross-token: read collateral balance once, swap all of it to debt token
             collateralReceived = IERC20(p.collateralAsset).balanceOf(address(this));
             if (collateralReceived > 0) {
                 _swapToDebtToken(
@@ -258,13 +265,17 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
                     collateralReceived, p.swapFeeTier, p.minSwapOut
                 );
             }
+            // Read debt balance after the swap (single call on this branch)
+            debtBalance = IERC20(p.debtAsset).balanceOf(address(this));
         } else {
-            // Same token: collateral received = current balance - what we already had
-            collateralReceived = IERC20(p.debtAsset).balanceOf(address(this)) - (amount - p.debtToCover);
+            // Same-token: flash loan amount == debtToCover (by construction), so
+            // the balance after liquidationCall equals exactly the collateral received.
+            // Read once and reuse — avoids a second balanceOf call.
+            debtBalance = IERC20(p.debtAsset).balanceOf(address(this));
+            collateralReceived = debtBalance;
         }
 
         // Step 4: Verify profitability
-        debtBalance = IERC20(p.debtAsset).balanceOf(address(this));
         if (debtBalance < totalDebt + p.minProfit) {
             revert NotProfitable(debtBalance, totalDebt + p.minProfit);
         }

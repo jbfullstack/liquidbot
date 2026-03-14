@@ -1,0 +1,15 @@
+# Environment — contains private key, NEVER commit
+.env
+bot/.env
+**/.env
+
+# Rust build artifacts
+bot/target/
+
+# Foundry build artifacts (regenerable with `forge build`)
+contracts/out/
+contracts/cache/
+
+# Runtime data
+bot/stats.json
+bot/stats.json.tmp

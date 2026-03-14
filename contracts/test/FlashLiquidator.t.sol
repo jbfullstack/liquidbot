@@ -106,9 +106,63 @@ contract MockUniRouter {
 
     function exactInputSingle(ExactInputSingleParams calldata p) external returns (uint256) {
         uint256 out = p.amountIn * rateBps / 10_000;
+        require(out >= p.amountOutMinimum, "slippage");
         MockERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
         MockERC20(p.tokenOut).transfer(p.recipient, out);
         return out;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INVARIANT HANDLER
+// ═══════════════════════════════════════════════════════════════
+
+/// @dev Wraps valid bounded liquidation calls for the invariant fuzzer.
+///      Without this, the fuzzer sends random inputs that all revert (NotOwner,
+///      wrong tokens, etc.) and the invariants pass trivially without exercising
+///      any real state transitions.
+contract InvariantHandler is Test {
+    FlashLiquidator public liq;
+    MockAavePool    public aave;
+    MockERC20       public usdc;
+    address         public owner;
+
+    uint256 constant U6  = 1e6;
+    uint256 constant U18 = 1e18;
+
+    // Ghost variable: tracks total profit swept to cold wallet across all calls.
+    // Used by the invariant to confirm funds actually moved.
+    uint256 public ghost_totalSwept;
+
+    constructor(
+        FlashLiquidator _liq,
+        MockAavePool    _aave,
+        MockERC20       _usdc,
+        address         _owner
+    ) {
+        liq   = _liq;
+        aave  = _aave;
+        usdc  = _usdc;
+        owner = _owner;
+    }
+
+    /// @dev Bounded same-token liquidation.  The fuzzer calls this with arbitrary
+    ///      seeds; bound() clamps them to a valid range.
+    function liquidateSameToken(uint256 debtSeed, uint256 bonusSeed) external {
+        uint256 debt  = bound(debtSeed, 100 * U6, 5_000 * U6);
+        uint256 bonus = bound(bonusSeed, 100, 1000); // 1%–10%
+
+        address victim = makeAddr(string(abi.encodePacked("victim", debtSeed)));
+        aave.setUserHF(victim, 0.90e18);
+        aave.setBonus(bonus);
+        // Ensure the Aave mock has enough liquidity for this liquidation
+        usdc.mint(address(aave), debt * 2);
+
+        uint256 coldBefore = usdc.balanceOf(liq.coldWallet());
+        vm.prank(owner);
+        try liq.liquidate(victim, address(usdc), address(usdc), debt, 3000, 0, 0) {
+            ghost_totalSwept += usdc.balanceOf(liq.coldWallet()) - coldBefore;
+        } catch {}
     }
 }
 
@@ -117,11 +171,12 @@ contract MockUniRouter {
 // ═══════════════════════════════════════════════════════════════
 
 contract FlashLiquidatorTest is Test {
-    FlashLiquidator public liq;
-    MockAavePool    public aave;
-    MockUniRouter   public uni;
-    MockERC20       public usdc;  // debt token
-    MockERC20       public weth;  // collateral token
+    FlashLiquidator  public liq;
+    MockAavePool     public aave;
+    MockUniRouter    public uni;
+    MockERC20        public usdc;  // debt token
+    MockERC20        public weth;  // collateral token
+    InvariantHandler public handler;
 
     address owner      = makeAddr("owner");
     address coldWallet = makeAddr("cold");
@@ -150,6 +205,16 @@ contract FlashLiquidatorTest is Test {
         weth.mint(address(aave), 5_000 * U18);
         usdc.mint(address(uni), 10_000_000 * U6);
         weth.mint(address(uni), 5_000 * U18);
+
+        // Wire invariant handler — only it is targeted; mocks and liq are excluded
+        // so the fuzzer cannot break preconditions by calling them directly.
+        handler = new InvariantHandler(liq, aave, usdc, owner);
+        targetContract(address(handler));
+        excludeContract(address(liq));
+        excludeContract(address(aave));
+        excludeContract(address(uni));
+        excludeContract(address(usdc));
+        excludeContract(address(weth));
     }
 
     // ─── A. Deployment ───────────────────────────────────────
@@ -202,6 +267,17 @@ contract FlashLiquidatorTest is Test {
         liq.liquidate(borrower, address(weth), address(usdc), 1000*U6, 3000, 0, 0);
     }
 
+    function test_B06_executeOpNotInFlashLoan() public {
+        // Aave pool IS the caller (passes onlyAavePool), but _locked != 2 because
+        // we are not inside a liquidate() call — must revert NotInFlashLoan.
+        bytes memory params = abi.encode(FlashLiquidator.LiqParams(
+            borrower, address(weth), address(usdc), 1000*U6, 3000, 0, 0
+        ));
+        vm.prank(address(aave));
+        vm.expectRevert(FlashLiquidator.NotInFlashLoan.selector);
+        liq.executeOperation(address(usdc), 1000*U6, 5, address(liq), params);
+    }
+
     // ─── C. Same-token liquidation (collateral == debt) ──────
 
     function test_C01_sameTokenLiquidation() public {
@@ -219,40 +295,51 @@ contract FlashLiquidatorTest is Test {
         );
 
         uint256 profit = usdc.balanceOf(coldWallet) - coldBefore;
-        console2.log("Same-token profit:", profit, "=", profit / U6, "USD");
+        console2.log("Same-token profit (raw):", profit);
+        console2.log("Same-token profit (USD):", profit / U6);
         assertGt(profit, 0, "must profit");
         assertEq(usdc.balanceOf(address(liq)), 0, "contract empty");
     }
 
     // ─── D. Cross-token liquidation (collateral != debt) ─────
+    // Scenario: borrower owes USDC (debt), locked DAI as collateral.
+    // Flow: flash loan USDC → liquidate → receive DAI → swap DAI→USDC → repay → profit in USDC.
 
     function test_D01_crossTokenLiquidation() public {
-        // Borrower borrowed USDC against WETH collateral
-        aave.setUserHF(borrower, 0.90e18);
-        aave.setBonus(500); // 5%
-
-        // For this test, WETH bonus is paid in WETH, then swapped to USDC
-        // Mock Aave gives USDC (collateral) with bonus, so let's use USDC as collateral
-        // and a different token as debt for cross-token test
-
         MockERC20 dai = new MockERC20("DAI", 18);
         dai.mint(address(aave), 10_000_000 * U18);
         dai.mint(address(uni), 10_000_000 * U18);
+        aave.setUserHF(borrower, 0.90e18);
+        aave.setBonus(500); // 5%
 
-        aave.setTokens(address(dai), address(usdc));
-
-        uint256 debtToCover = 500 * U6; // borrow 500 USDC
-        uint256 coldBefore = usdc.balanceOf(coldWallet);
+        uint256 debtToCover = 500 * U6; // 500 USDC
+        uint256 coldBefore  = usdc.balanceOf(coldWallet);
 
         vm.prank(owner);
+        // collateralAsset=DAI, debtAsset=USDC → exercises the Uniswap swap path
         liq.liquidate(
-            borrower, address(usdc), address(usdc),
-            debtToCover, 3000, 0, 0
+            borrower, address(dai), address(usdc),
+            debtToCover, 3000, 1, 0  // minSwapOut=1 (non-zero to exercise slippage guard)
         );
 
         uint256 profit = usdc.balanceOf(coldWallet) - coldBefore;
-        console2.log("Cross-token profit:", profit);
+        console2.log("Cross-token profit (USDC raw):", profit);
         assertGt(profit, 0, "must profit");
+    }
+
+    function test_D02_crossTokenContractEmpty() public {
+        // After cross-token: contract must hold zero of BOTH tokens (no DAI dust, no USDC residual)
+        MockERC20 dai = new MockERC20("DAI", 18);
+        dai.mint(address(aave), 10_000_000 * U18);
+        dai.mint(address(uni), 10_000_000 * U18);
+        aave.setUserHF(borrower, 0.90e18);
+        aave.setBonus(500);
+
+        vm.prank(owner);
+        liq.liquidate(borrower, address(dai), address(usdc), 500*U6, 3000, 1, 0);
+
+        assertEq(dai.balanceOf(address(liq)),  0, "no residual DAI");
+        assertEq(usdc.balanceOf(address(liq)), 0, "no residual USDC");
     }
 
     // ─── E. Profitability checks ─────────────────────────────
@@ -276,6 +363,26 @@ contract FlashLiquidatorTest is Test {
             borrower, address(usdc), address(usdc),
             1000*U6, 3000,
             0, 100 * U6 // require $100 min profit → impossible with 0.5% on $1k
+        );
+    }
+
+    function test_E03_revertMinSwapOut() public {
+        // Cross-token: verify Uniswap slippage guard fires when minSwapOut is too high.
+        // Router at 99.9% rate → 500 USDC flash → receives 525 DAI → swap yields ~524.4 USDC.
+        // Setting minSwapOut to 10M USDC must revert with "slippage".
+        MockERC20 dai = new MockERC20("DAI", 18);
+        dai.mint(address(aave), 10_000_000 * U18);
+        dai.mint(address(uni), 10_000_000 * U18);
+        aave.setUserHF(borrower, 0.90e18);
+        aave.setBonus(500);
+
+        vm.prank(owner);
+        vm.expectRevert(bytes("slippage"));
+        liq.liquidate(
+            borrower, address(dai), address(usdc),
+            500*U6, 3000,
+            10_000_000 * U6, // impossibly high minSwapOut
+            0
         );
     }
 
@@ -383,8 +490,12 @@ contract FlashLiquidatorTest is Test {
     // ─── L. Invariants ───────────────────────────────────────
 
     function invariant_L01_contractEmpty() public view {
-        assertEq(usdc.balanceOf(address(liq)), 0);
-        assertEq(weth.balanceOf(address(liq)), 0);
+        assertEq(usdc.balanceOf(address(liq)), 0, "USDC residual in contract");
+        assertEq(weth.balanceOf(address(liq)), 0, "WETH residual in contract");
+        // If the handler ran any successful liquidation, profits must be in cold wallet
+        if (handler.ghost_totalSwept() > 0) {
+            assertGt(usdc.balanceOf(liq.coldWallet()), 0, "profit not swept to cold");
+        }
     }
 
     function invariant_L02_coldFixed() public view {

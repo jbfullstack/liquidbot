@@ -5,8 +5,18 @@
 //! Then message your bot, visit https://api.telegram.org/bot<TOKEN>/getUpdates
 //! to find your chat_id.
 
-use eyre::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Commands the Telegram listener sends back to the main loop.
+#[derive(Debug)]
+pub enum TelegramCommand {
+    PauseBot,
+    ResumeBot,
+    PauseContract,
+    ResumeContract,
+}
 
 #[derive(Clone)]
 pub struct TelegramNotifier {
@@ -72,8 +82,10 @@ impl TelegramNotifier {
             ⛽ ETH: <b>{:.6} ETH</b>\n\
             👥 Users suivis: <b>{}</b>\n\
             ⚠️ À risque: <b>{}</b>",
-            self.bot_name, 
-            &hot_wallet[..8], &cold_wallet[..8], &contract[..8],
+            self.bot_name,
+            &hot_wallet[..hot_wallet.len().min(8)],
+            &cold_wallet[..cold_wallet.len().min(8)],
+            &contract[..contract.len().min(8)],
             eth_balance, users_tracked, at_risk
         );
         self.send(&msg).await;
@@ -98,7 +110,7 @@ impl TelegramNotifier {
         close_factor_pct: u8,
         gas_estimate: u64,
         gas_cost_usd: f64,
-        expected_profit_usd: f64,
+        _expected_profit_usd: f64,
         // Result
         success: bool,
         tx_hash: &str,
@@ -169,7 +181,7 @@ impl TelegramNotifier {
             "{} 🔍 Simulation skip\n\
             👤 <code>{}</code>\n\
             💭 {}",
-            self.bot_name, &user[..10], reason,
+            self.bot_name, &user[..user.len().min(10)], reason,
         );
         self.send(&msg).await;
     }
@@ -186,8 +198,8 @@ impl TelegramNotifier {
         let msg = format!(
             "{} 💸 <b>ETH envoyé au cold wallet</b>\n\
             \n\
-            　Envoyé: <b>{:.6} ETH</b>\n\
-            　Hot restant: {:.6} ETH",
+              Envoyé: <b>{:.6} ETH</b>\n\
+              Hot restant: {:.6} ETH",
             self.bot_name, amount_eth, hot_remaining_eth,
         );
         self.send(&msg).await;
@@ -211,9 +223,7 @@ impl TelegramNotifier {
     pub async fn notify_low_eth(&self, balance_eth: f64) {
         let msg = format!(
             "{} ⛽ <b>ETH bas !</b>\n\
-            \n\
-            　Balance: <b>{:.6} ETH</b>\n\
-            　⚠️ Recharge le hot wallet !",
+            \n Balance: <b>{:.6} ETH</b>\n ⚠️ Recharge le hot wallet !",
             self.bot_name, balance_eth,
         );
         self.send(&msg).await;
@@ -241,14 +251,14 @@ impl TelegramNotifier {
             ⏱️ Uptime: {:.1}h\n\
             \n\
             📊 <b>Aujourd'hui:</b>\n\
-            　Liquidations: {}\n\
-            　Profit: ${:.2}\n\
-            　Gas: -${:.4}\n\
-            　Net: <b>${:.2}</b>\n\
+              Liquidations: {}\n\
+              Profit: ${:.2}\n\
+              Gas: -${:.4}\n\
+              Net: <b>${:.2}</b>\n\
             \n\
             📊 <b>Total (session):</b>\n\
-            　Liquidations: {}\n\
-            　Profit: <b>${:.2}</b>\n\
+              Liquidations: {}\n\
+              Profit: <b>${:.2}</b>\n\
             \n\
             👥 Users suivis: {}\n\
             ⚠️ À risque: {}\n\
@@ -271,18 +281,25 @@ impl TelegramNotifier {
     /// Runs in a separate tokio task, never blocks the main bot.
     ///
     /// Commands:
-    ///   /status  — is the bot alive, uptime, current state
-    ///   /stats   — full P&L summary
-    ///   /json    — sends stats.json as a document
-    ///   /help    — list commands
+    ///   /status           — is the bot alive, uptime, current state
+    ///   /stats            — full P&L summary
+    ///   /json             — sends stats.json as a document
+    ///   /help             — list commands
+    ///   /stop_bot         — pause liquidations (process stays alive)
+    ///   /start_bot        — resume liquidations
+    ///   /pause_contract   — call setPaused(true) on-chain
+    ///   /resume_contract  — call setPaused(false) on-chain
     pub async fn run_command_listener(
         self,
         started_at: std::time::Instant,
         stats_path: String,
         // Shared state for live info
         hot_wallet: String,
-        users_tracked: std::sync::Arc<tokio::sync::RwLock<usize>>,
-        at_risk_count: std::sync::Arc<tokio::sync::RwLock<u32>>,
+        users_tracked: Arc<tokio::sync::RwLock<usize>>,
+        at_risk_count: Arc<tokio::sync::RwLock<u32>>,
+        bot_active: Arc<AtomicBool>,
+        cmd_sender: tokio::sync::mpsc::Sender<TelegramCommand>,
+        hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
     ) {
         // Separate client with long timeout for Telegram long-polling
         let poll_client = reqwest::Client::builder()
@@ -292,16 +309,22 @@ impl TelegramNotifier {
 
         let mut last_update_id: i64 = 0;
 
-        // Get initial offset (skip old messages)
-        if let Some(id) = self.get_latest_update_id(&poll_client).await {
-            last_update_id = id + 1;
+        // Get initial offset (skip old messages on startup)
+        match self.get_latest_update_id(&poll_client).await {
+            Some(id) => {
+                last_update_id = id + 1;
+                tracing::info!("📱 Telegram listener prêt (update_id offset={})", id);
+            }
+            None => {
+                tracing::info!("📱 Telegram listener prêt (aucun message précédent)");
+            }
         }
 
         loop {
             let updates = match self.get_updates(&poll_client, last_update_id).await {
                 Some(u) => u,
                 None => {
-                    // Network error — wait before retry
+                    // Erreur réseau ou API — déjà loggué dans get_updates
                     tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     continue;
                 }
@@ -316,11 +339,13 @@ impl TelegramNotifier {
                 // Only respond to messages from our chat_id
                 let chat_id = update["message"]["chat"]["id"].to_string();
                 if chat_id.trim_matches('"') != self.chat_id {
+                    tracing::debug!("Telegram: message ignoré (chat_id={} != attendu={})", chat_id, self.chat_id);
                     continue;
                 }
 
                 let text = update["message"]["text"].as_str().unwrap_or("");
                 let cmd = text.split_whitespace().next().unwrap_or("");
+                tracing::info!("📱 Telegram commande reçue: '{cmd}' (update_id={update_id})");
 
                 match cmd {
                     "/status" | "/s" => {
@@ -329,12 +354,14 @@ impl TelegramNotifier {
                         let mins = (uptime.as_secs() % 3600) / 60;
                         let tracked = *users_tracked.read().await;
                         let risk = *at_risk_count.read().await;
+                        let active = bot_active.load(Ordering::Relaxed);
 
                         // Load stats for quick numbers
                         let stats = crate::stats::StatsStore::load();
 
+                        let status_icon = if active { "🟢 <b>Bot is UP</b>" } else { "🟡 <b>Bot PAUSÉ</b>" };
                         let msg = format!(
-                            "{} 🟢 <b>Bot is UP</b>\n\
+                            "{} {}\n\
                             \n\
                             ⏱️ Uptime: {}h {}min\n\
                             🔑 Hot: <code>{}</code>\n\
@@ -342,7 +369,7 @@ impl TelegramNotifier {
                             ⚠️ À risque: {}\n\
                             ✅ Liquidations: {}\n\
                             💰 Profit total: <b>${:.2}</b>",
-                            self.bot_name,
+                            self.bot_name, status_icon,
                             hours, mins,
                             &hot_wallet[..hot_wallet.len().min(10)],
                             tracked, risk,
@@ -362,13 +389,67 @@ impl TelegramNotifier {
                         self.send_document(&stats_path).await;
                     }
 
+                    "/hf" => {
+                        let list = hf_list.read().await;
+                        if list.is_empty() {
+                            let msg = format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name);
+                            self.send(&msg).await;
+                        } else {
+                            let mut msg = format!(
+                                "{} 🔍 <b>{} positions à risque</b> (HF &lt; seuil)\n\n\
+                                <code>HF      Dette       Adresse</code>\n",
+                                self.bot_name, list.len()
+                            );
+                            for (addr, hf, debt) in list.iter().take(30) {
+                                let danger = if *hf < 1.0 { "🔴" } else { "🟡" };
+                                msg.push_str(&format!(
+                                    "{} {:.4}  ${:>10.2}  <code>{}…{}</code>\n",
+                                    danger, hf, debt,
+                                    &addr[..6], &addr[addr.len()-4..],
+                                ));
+                            }
+                            if list.len() > 30 {
+                                msg.push_str(&format!("\n<i>+{} autres non affichées</i>", list.len() - 30));
+                            }
+                            self.send(&msg).await;
+                        }
+                    }
+
+                    "/stop_bot" => {
+                        let _ = cmd_sender.send(TelegramCommand::PauseBot).await;
+                    }
+
+                    "/start_bot" => {
+                        let _ = cmd_sender.send(TelegramCommand::ResumeBot).await;
+                    }
+
+                    "/pause_contract" => {
+                        self.send(&format!("{} ⏳ Envoi de setPaused(true)...", self.bot_name)).await;
+                        let _ = cmd_sender.send(TelegramCommand::PauseContract).await;
+                    }
+
+                    "/resume_contract" => {
+                        self.send(&format!("{} ⏳ Envoi de setPaused(false)...", self.bot_name)).await;
+                        let _ = cmd_sender.send(TelegramCommand::ResumeContract).await;
+                    }
+
                     "/help" | "/start" => {
                         let msg = format!(
                             "{} 📖 <b>Commandes</b>\n\
                             \n\
                             /status — état du bot (up/down, uptime)\n\
                             /stats — bilan complet P&amp;L\n\
+                            /hf — positions à risque (HF, dette, adresse)\n\
                             /json — télécharger stats.json\n\
+                            \n\
+                            <b>Contrôle bot:</b>\n\
+                            /stop_bot — suspendre les liquidations\n\
+                            /start_bot — reprendre les liquidations\n\
+                            \n\
+                            <b>Contrôle contrat:</b>\n\
+                            /pause_contract — mettre le contrat en pause (on-chain)\n\
+                            /resume_contract — réactiver le contrat (on-chain)\n\
+                            \n\
                             /help — cette aide",
                             self.bot_name,
                         );
@@ -385,12 +466,31 @@ impl TelegramNotifier {
     /// One request hangs for up to 30s, returns instantly when a message arrives.
     /// Result: ~1 HTTP request per 30s idle, instant response when you type a command.
     async fn get_updates(&self, client: &reqwest::Client, offset: i64) -> Option<Vec<serde_json::Value>> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=300&allowed_updates=[\"message\"]",
-            self.token, offset
-        );
-        let resp = client.get(&url).send().await.ok()?;
-        let json: serde_json::Value = resp.json().await.ok()?;
+        // POST avec JSON body — plus fiable que GET avec paramètres encodés à la main
+        let url = format!("https://api.telegram.org/bot{}/getUpdates", self.token);
+        let body = serde_json::json!({
+            "offset": offset,
+            "timeout": 300,
+            "allowed_updates": ["message"]
+        });
+        let resp = match client.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Telegram getUpdates réseau: {e}");
+                return None;
+            }
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("Telegram getUpdates parse: {e}");
+                return None;
+            }
+        };
+        if !json["ok"].as_bool().unwrap_or(false) {
+            tracing::warn!("Telegram API erreur: {}", json["description"].as_str().unwrap_or("?"));
+            return None;
+        }
         json["result"].as_array().cloned()
     }
 
