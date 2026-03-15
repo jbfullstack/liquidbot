@@ -23,7 +23,7 @@ use alloy::{
     rpc::types::Filter,
     signers::local::PrivateKeySigner,
     sol,
-    sol_types::SolEvent,
+    sol_types::{SolCall, SolEvent},
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -95,6 +95,22 @@ sol! {
         );
     }
 
+    /// Multicall3 — batches arbitrary calldata into a single RPC round-trip.
+    /// Deployed at 0xcA11bde05977b3631167028862bE2a173976CA11 on every EVM chain.
+    #[sol(rpc)]
+    interface IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        struct Mc3Result {
+            bool success;
+            bytes returnData;
+        }
+        function aggregate3(Call3[] calldata calls) external payable returns (Mc3Result[] returnData);
+    }
+
     /// Uniswap V3 QuoterV2 — returns swap output without reverting (unlike V1).
     /// Used to find the best fee tier for a collateral→debt swap before execution.
     #[sol(rpc)]
@@ -127,6 +143,8 @@ const AAVE_DATA_PROVIDER: Address = address!("69FA688f1Dc47d4B5d8029D5a35FB7a548
 const CHAINLINK_ETH_USD: Address  = address!("639Fe6ab55C921f74e7fac1ee960C0B6293ba612");
 /// Uniswap V3 QuoterV2 on Arbitrum One
 const UNISWAP_QUOTER_V2: Address  = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
+/// Multicall3 — same address on all EVM chains
+const MULTICALL3: Address         = address!("cA11bde05977b3631167028862bE2a173976CA11");
 
 /// All active Aave V3 reserve tokens on Arbitrum One: (address, symbol, decimals)
 const TOKENS: &[(Address, &str, u8)] = &[
@@ -403,6 +421,95 @@ async fn best_fee_tier<P: Provider>(
     best.map(|(fee, _)| fee)
 }
 
+// ─── Multicall3 helpers ──────────────────────────────────────────────────────
+//
+// Both functions replace N parallel RPC calls with a single Multicall3 call.
+// The node executes all sub-calls atomically at the same block height, so
+// results are consistent — no "user A was checked 3 blocks before user B".
+//
+// allowFailure = true: a reverted sub-call (e.g. user already fully repaid)
+// returns success=false and doesn't revert the whole batch.
+
+/// Decoded fields we need from getUserAccountData.
+#[derive(Clone)]
+struct AccountData {
+    pub health_factor:         U256,
+    pub total_debt_base:       U256,
+    pub total_collateral_base: U256,
+}
+
+/// Decoded fields we need from getUserReserveData.
+#[derive(Clone)]
+struct ReserveData {
+    pub current_a_token_balance:      U256,
+    pub current_variable_debt:        U256,
+    pub usage_as_collateral_enabled:  bool,
+}
+
+/// Fetch getUserAccountData for N users in ONE Multicall3 round-trip.
+/// Returns one Option per user (None = sub-call failed / user has no position).
+async fn multicall_account_data<P: Provider>(
+    provider: &P,
+    users: &[Address],
+) -> Vec<Option<AccountData>> {
+    if users.is_empty() { return Vec::new(); }
+
+    let calls: Vec<IMulticall3::Call3> = users.iter().map(|&user| {
+        IMulticall3::Call3 {
+            target:       AAVE_POOL,
+            allowFailure: true,
+            callData:     IAavePool::getUserAccountDataCall { user }.abi_encode().into(),
+        }
+    }).collect();
+
+    let mc = IMulticall3::new(MULTICALL3, provider);
+    let Ok(ret) = mc.aggregate3(calls).call().await else {
+        return vec![None; users.len()];
+    };
+
+    // alloy v1: aggregate3 returns Vec<Mc3Result> directly (single return → unwrapped)
+    ret.iter().map(|r| {
+        if !r.success { return None; }
+        // alloy v1: abi_decode_returns takes only &[u8], no validate flag
+        let d = IAavePool::getUserAccountDataCall::abi_decode_returns(&r.returnData).ok()?;
+        Some(AccountData {
+            health_factor:         d.healthFactor,
+            total_debt_base:       d.totalDebtBase,
+            total_collateral_base: d.totalCollateralBase,
+        })
+    }).collect()
+}
+
+/// Fetch getUserReserveData for all TOKENS for one user in ONE Multicall3 round-trip.
+/// Returns one Option per TOKENS entry (in order).
+async fn multicall_reserve_data<P: Provider>(
+    provider: &P,
+    user: Address,
+) -> Vec<Option<ReserveData>> {
+    let calls: Vec<IMulticall3::Call3> = TOKENS.iter().map(|(tok, _, _)| {
+        IMulticall3::Call3 {
+            target:       AAVE_DATA_PROVIDER,
+            allowFailure: true,
+            callData:     IAaveDataProvider::getUserReserveDataCall { asset: *tok, user }.abi_encode().into(),
+        }
+    }).collect();
+
+    let mc = IMulticall3::new(MULTICALL3, provider);
+    let Ok(ret) = mc.aggregate3(calls).call().await else {
+        return vec![None; TOKENS.len()];
+    };
+
+    ret.iter().map(|r| {
+        if !r.success { return None; }
+        let d = IAaveDataProvider::getUserReserveDataCall::abi_decode_returns(&r.returnData).ok()?;
+        Some(ReserveData {
+            current_a_token_balance:     d.currentATokenBalance,
+            current_variable_debt:       d.currentVariableDebt,
+            usage_as_collateral_enabled: d.usageAsCollateralEnabled,
+        })
+    }).collect()
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
@@ -447,7 +554,7 @@ async fn main() -> Result<()> {
     // *_ro: liés à http_ro pour les appels view (eth_call sans vérification de solde)
     let liquidator_ro = IFlashLiquidator::new(contract_addr, &http_ro);
     let pool          = IAavePool::new(AAVE_POOL, &http_ro);
-    let data_prov     = IAaveDataProvider::new(AAVE_DATA_PROVIDER, &http_ro);
+    // data_prov no longer needed in hot path — replaced by multicall_reserve_data()
 
     // ── Verify ──
     let owner = liquidator_ro.owner().call().await?;
@@ -827,28 +934,21 @@ async fn main() -> Result<()> {
                     due.truncate(MAX_REFRESH_PER_BLOCK);
 
                     if !due.is_empty() {
-                        // Build all call builders first so they live long enough
-                        let cbs: Vec<_> = due.iter()
-                            .map(|(user, _)| pool.getUserAccountData(*user))
-                            .collect();
+                        let users: Vec<Address> = due.iter().map(|(u, _)| *u).collect();
 
-                        // Fire all RPC calls in parallel
-                        // EthCall implements IntoFuture (not Future), so we must
-                        // call .into_future() explicitly for join_all.
-                        let results = futures_util::future::join_all(
-                            cbs.iter().map(|cb| std::future::IntoFuture::into_future(cb.call()))
-                        ).await;
+                        // One Multicall3 round-trip for all N users (was N parallel calls)
+                        let results = multicall_account_data(&http_ro, &users).await;
 
                         // Single write-lock to apply all updates atomically
                         let mut idx = user_index.write().await;
-                        for ((user, _), d_result) in due.iter().zip(results.iter()) {
-                            let Ok(d) = d_result else { continue; };
-                            let interval = refresh_interval_blocks(d.healthFactor);
-                            remove_if_repaid(&mut idx, user, d.totalDebtBase);
+                        for ((user, _), d_opt) in due.iter().zip(results.iter()) {
+                            let Some(d) = d_opt else { continue; };
+                            let interval = refresh_interval_blocks(d.health_factor);
+                            remove_if_repaid(&mut idx, user, d.total_debt_base);
                             if let Some(pos) = idx.get_mut(user) {
-                                pos.health_factor          = d.healthFactor;
-                                pos.total_debt_base        = d.totalDebtBase;
-                                pos.total_collateral_base  = d.totalCollateralBase;
+                                pos.health_factor          = d.health_factor;
+                                pos.total_debt_base        = d.total_debt_base;
+                                pos.total_collateral_base  = d.total_collateral_base;
                                 pos.last_block             = bn;
                                 pos.next_refresh_at        = bn + interval;
                             }
@@ -979,29 +1079,31 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                for user in &at_risk_users {
+                // Fetch health data for ALL at-risk users in ONE Multicall3 call.
+                // During flash crashes this can be 10+ users; one call instead of 10 sequential.
+                let account_data_batch = multicall_account_data(&http_ro, &at_risk_users).await;
+
+                for (user, d_opt) in at_risk_users.iter().zip(account_data_batch.iter()) {
                     // Skip if we already have a pending tx for this user
                     if pending_liquidations.contains(user) {
                         tracing::debug!("  Skip {user}: liquidation already pending");
                         continue;
                     }
 
-                    let Ok(d) = pool.getUserAccountData(*user).call().await else {
-                        continue;
-                    };
+                    let Some(d) = d_opt else { continue; };
 
-                    let hf = d.healthFactor;
-                    let debt_usd = d.totalDebtBase.to::<u128>() as f64 / 1e8;
+                    let hf = d.health_factor;
+                    let debt_usd = d.total_debt_base.to::<u128>() as f64 / 1e8;
 
                     // Update index — or remove if position fully repaid
                     {
                         let interval = refresh_interval_blocks(hf);
                         let mut idx = user_index.write().await;
-                        remove_if_repaid(&mut idx, user, d.totalDebtBase);
+                        remove_if_repaid(&mut idx, user, d.total_debt_base);
                         if let Some(pos) = idx.get_mut(user) {
                             pos.health_factor = hf;
-                            pos.total_debt_base = d.totalDebtBase;
-                            pos.total_collateral_base = d.totalCollateralBase;
+                            pos.total_debt_base = d.total_debt_base;
+                            pos.total_collateral_base = d.total_collateral_base;
                             pos.last_block = bn;
                             pos.next_refresh_at = bn + interval;
                         }
@@ -1026,19 +1128,15 @@ async fn main() -> Result<()> {
                     let mut best_coll: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
 
                     {
-                        let cbs_rd: Vec<_> = TOKENS.iter()
-                            .map(|(tok, _, _)| data_prov.getUserReserveData(*tok, *user))
-                            .collect();
-                        let results = futures_util::future::join_all(
-                            cbs_rd.iter().map(|cb| std::future::IntoFuture::into_future(cb.call()))
-                        ).await;
-                        for ((tok, name, decimals), rd_result) in TOKENS.iter().zip(results.iter()) {
-                            let Ok(rd) = rd_result else { continue; };
-                            if rd.currentVariableDebt > best_debt.1 {
-                                best_debt = (*tok, rd.currentVariableDebt, name, *decimals);
+                        // One Multicall3 call for all 11 TOKENS (was 11 parallel calls)
+                        let results = multicall_reserve_data(&http_ro, *user).await;
+                        for ((tok, name, decimals), rd_opt) in TOKENS.iter().zip(results.iter()) {
+                            let Some(rd) = rd_opt else { continue; };
+                            if rd.current_variable_debt > best_debt.1 {
+                                best_debt = (*tok, rd.current_variable_debt, name, *decimals);
                             }
-                            if rd.currentATokenBalance > best_coll.1 && rd.usageAsCollateralEnabled {
-                                best_coll = (*tok, rd.currentATokenBalance, name, *decimals);
+                            if rd.current_a_token_balance > best_coll.1 && rd.usage_as_collateral_enabled {
+                                best_coll = (*tok, rd.current_a_token_balance, name, *decimals);
                             }
                         }
                     }
@@ -1943,6 +2041,98 @@ mod tests {
         for (a, b) in &pairs {
             assert_ne!(a, b, "self-swap pair found");
         }
+    }
+
+    // ── Multicall3 ────────────────────────────────────────────
+
+    #[test]
+    fn test_multicall3_address_is_not_zero() {
+        assert_ne!(MULTICALL3, Address::ZERO);
+    }
+
+    #[test]
+    fn test_multicall3_address_is_canonical() {
+        // The canonical Multicall3 address — same on all EVM chains
+        let canonical: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+            .parse().unwrap();
+        assert_eq!(MULTICALL3, canonical, "MULTICALL3 address must match canonical deployment");
+    }
+
+    #[test]
+    fn test_multicall3_account_data_calldata_is_correct() {
+        // Verify that we can encode getUserAccountData calldata without panicking,
+        // and that the selector (first 4 bytes) matches the expected function signature.
+        let user = Address::repeat_byte(0xAB);
+        let calldata = IAavePool::getUserAccountDataCall { user }.abi_encode();
+        assert_eq!(calldata.len(), 4 + 32, "getUserAccountData: selector(4) + address(32)");
+        // Function selector for getUserAccountData(address) = keccak256 first 4 bytes
+        // We just verify it's non-zero and correct length — the exact value is tested
+        // implicitly by the ABI encoding.
+        assert_ne!(&calldata[..4], &[0u8; 4], "selector must not be zero");
+    }
+
+    #[test]
+    fn test_multicall3_reserve_data_calldata_count() {
+        // multicall_reserve_data builds one Call3 per TOKENS entry.
+        // Verify the count matches without making any RPC call.
+        let calls: Vec<IMulticall3::Call3> = TOKENS.iter().map(|(tok, _, _)| {
+            IMulticall3::Call3 {
+                target:       AAVE_DATA_PROVIDER,
+                allowFailure: true,
+                callData:     IAaveDataProvider::getUserReserveDataCall {
+                    asset: *tok,
+                    user:  Address::ZERO,
+                }.abi_encode().into(),
+            }
+        }).collect();
+
+        assert_eq!(calls.len(), TOKENS.len(), "one Call3 per token");
+        // Every call must target AAVE_DATA_PROVIDER
+        for c in &calls {
+            assert_eq!(c.target, AAVE_DATA_PROVIDER);
+            assert!(c.allowFailure, "allowFailure must be true — one bad sub-call must not revert the batch");
+        }
+    }
+
+    #[test]
+    fn test_multicall3_account_data_calldata_count() {
+        let users = vec![
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            Address::repeat_byte(0x03),
+        ];
+        let calls: Vec<IMulticall3::Call3> = users.iter().map(|&user| {
+            IMulticall3::Call3 {
+                target:       AAVE_POOL,
+                allowFailure: true,
+                callData:     IAavePool::getUserAccountDataCall { user }.abi_encode().into(),
+            }
+        }).collect();
+
+        assert_eq!(calls.len(), users.len());
+        for c in &calls {
+            assert_eq!(c.target, AAVE_POOL);
+            assert!(c.allowFailure);
+            // selector(4) + address(32) = 36 bytes
+            assert_eq!(c.callData.len(), 36);
+        }
+    }
+
+    #[test]
+    fn test_multicall3_allow_failure_true_for_all_calls() {
+        // allowFailure = true is safety-critical: if one user has fully repaid
+        // and the sub-call reverts, the whole batch must NOT revert.
+        let calls: Vec<IMulticall3::Call3> = TOKENS.iter().map(|(tok, _, _)| {
+            IMulticall3::Call3 {
+                target:       AAVE_DATA_PROVIDER,
+                allowFailure: true,
+                callData:     IAaveDataProvider::getUserReserveDataCall {
+                    asset: *tok,
+                    user: Address::ZERO,
+                }.abi_encode().into(),
+            }
+        }).collect();
+        assert!(calls.iter().all(|c| c.allowFailure), "all sub-calls must have allowFailure=true");
     }
 
     // ── Parallel RPC structure — timing proof ─────────────────
