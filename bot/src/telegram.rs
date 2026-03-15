@@ -301,6 +301,8 @@ impl TelegramNotifier {
         cmd_sender: tokio::sync::mpsc::Sender<TelegramCommand>,
         hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
         hf_threshold: f64,
+        min_profit_usd: f64,
+        dust_excluded: Arc<std::sync::atomic::AtomicU32>,
         eth_balance: Arc<tokio::sync::RwLock<f64>>,
         eth_price: Arc<tokio::sync::RwLock<f64>>,
     ) {
@@ -455,7 +457,9 @@ impl TelegramNotifier {
 
                     "/hf" => {
                         let list = hf_list.read().await;
-                        if list.is_empty() {
+                        let dust = dust_excluded.load(std::sync::atomic::Ordering::Relaxed);
+                        let min_debt_usd = min_profit_usd * 20.0;
+                        if list.is_empty() && dust == 0 {
                             let msg = format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name);
                             self.send(&msg).await;
                         } else {
@@ -474,7 +478,12 @@ impl TelegramNotifier {
                             }
                             msg.push_str("</pre>");
                             if list.len() > 30 {
-                                msg.push_str(&format!("<i>+{} autres non affichées</i>", list.len() - 30));
+                                msg.push_str(&format!("<i>+{} autres non affichées</i>\n", list.len() - 30));
+                            }
+                            if dust > 0 {
+                                msg.push_str(&format!(
+                                    "⚫ <i>{dust} position(s) ignorée(s) volontairement (dette &lt; ${min_debt_usd:.0} — non rentable à 5% bonus)</i>"
+                                ));
                             }
                             self.send(&msg).await;
                         }

@@ -130,6 +130,17 @@ impl StatsStore {
         self.records.iter().filter(|r| !r.success).count()
     }
 
+    /// Today's stats: (successes, gross_profit, gas_burned)
+    pub fn today_summary(&self) -> (u32, f64, f64) {
+        let today = Utc::now().date_naive().to_string(); // "YYYY-MM-DD"
+        let (mut count, mut profit, mut gas) = (0u32, 0.0f64, 0.0f64);
+        for r in self.records.iter().filter(|r| r.timestamp.starts_with(&today)) {
+            if r.success { count += 1; profit += r.profit_usd; }
+            gas += r.gas_usd;
+        }
+        (count, profit, gas)
+    }
+
     /// Aggregate profit by year → month
     /// Returns BTreeMap<year, BTreeMap<month, profit>>
     pub fn monthly_breakdown(&self) -> BTreeMap<i32, BTreeMap<u32, f64>> {

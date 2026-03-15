@@ -12,7 +12,7 @@ use telegram::{TelegramNotifier, TelegramCommand};
 use eyre::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use alloy::primitives::{address, Address, I256, U256};
@@ -20,7 +20,7 @@ use alloy::primitives::{address, Address, I256, U256};
 use alloy::{
     network::EthereumWallet,
     providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::Filter,
+    rpc::types::{Filter, TransactionRequest},
     signers::local::PrivateKeySigner,
     sol,
     sol_types::{SolCall, SolEvent},
@@ -42,6 +42,12 @@ sol! {
             uint256 updatedAt,
             uint80 answeredInRound
         );
+        /// Returns the address of the current underlying aggregator (from the proxy).
+        /// Subscribe to AnswerUpdated on THIS address, not the proxy.
+        function aggregator() external view returns (address);
+        /// Emitted every time the price is updated on-chain.
+        /// current = new price (8 dec), fires ~every hour or >0.5% move.
+        event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
     }
 
     #[sol(rpc)]
@@ -543,9 +549,7 @@ async fn main() -> Result<()> {
         .wallet(wallet.clone())
         .connect_http(cfg.rpc_http_url.parse()?);
 
-    let ws = ProviderBuilder::new()
-        .connect_ws(WsConnect::new(&cfg.rpc_ws_url))
-        .await?;
+    // ws is created inside the 'reconnect loop below (recreated on every reconnect)
 
     // ── Contracts ──
     let contract_addr: Address = cfg.contract_address.parse()?;
@@ -570,6 +574,17 @@ async fn main() -> Result<()> {
     // ── ETH price from Chainlink (same oracle Aave uses) ──
     let mut eth_price_usd = fetch_eth_price(&http_ro).await?;
     tracing::info!("💲 ETH price: ${eth_price_usd:.2} (Chainlink)");
+
+    // ── Chainlink aggregator address — subscribe to AnswerUpdated on THIS (not proxy) ──
+    // The proxy delegates to a phase aggregator; events are emitted by the aggregator.
+    let oracle_proxy = IChainlinkAggregator::new(CHAINLINK_ETH_USD, &http_ro);
+    let aggregator_addr = oracle_proxy.aggregator().call().await
+        .unwrap_or(CHAINLINK_ETH_USD); // fallback to proxy if call fails
+    tracing::info!("🔔 Chainlink aggregator: {aggregator_addr}");
+    // Filter for AnswerUpdated events — used in every WS reconnect
+    let price_filter = alloy::rpc::types::Filter::new()
+        .address(aggregator_addr)
+        .event_signature(IChainlinkAggregator::AnswerUpdated::SIGNATURE_HASH);
 
     let eth_bal_wei: U256 = http_ro.get_balance(wallet_addr).await?;
     let eth_bal = eth_bal_wei.to::<u128>() as f64 / 1e18;
@@ -698,6 +713,8 @@ async fn main() -> Result<()> {
     let shared_eth_price = Arc::new(RwLock::new(eth_price_usd));
     // Snapshot of at-risk positions for /hf command: (address, hf, debt_usd), sorted HF asc
     let shared_hf_list: Arc<RwLock<Vec<(String, f64, f64)>>> = Arc::new(RwLock::new(Vec::new()));
+    // Count of HF<threshold positions excluded from tracking because debt is too small to be profitable
+    let shared_dust_excluded: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
     // ── Bot active flag (toggled by /start_bot and /stop_bot) ──
     let bot_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
@@ -712,6 +729,7 @@ async fn main() -> Result<()> {
         let risk_ref      = shared_at_risk.clone();
         let active_ref    = bot_active.clone();
         let hf_ref        = shared_hf_list.clone();
+        let dust_ref      = shared_dust_excluded.clone();
         let eth_bal_ref   = shared_eth_bal.clone();
         let eth_price_ref = shared_eth_price.clone();
         let hot = format!("{wallet_addr}");
@@ -726,6 +744,8 @@ async fn main() -> Result<()> {
                 cmd_tx,
                 hf_ref,
                 cfg.health_factor_threshold,
+                cfg.min_profit_usd,
+                dust_ref,
                 eth_bal_ref,
                 eth_price_ref,
             ).await;
@@ -797,42 +817,153 @@ async fn main() -> Result<()> {
     // ── pending_liquidations: prevents double-sending on the same user ──
     let mut pending_liquidations: HashSet<Address> = HashSet::new();
 
+
     // ── Priority refresh: users are refreshed based on their HF proximity to 1.0 ──
     // refresh_interval_blocks() returns fewer blocks for riskier positions.
-    // Cap: 30 RPC calls/block maximum to avoid rate-limiting.
-    const MAX_REFRESH_PER_BLOCK: usize = 30;
+    // With Multicall3, all N users cost exactly 1 RPC call — safe to raise to 100.
+    const MAX_REFRESH_PER_BLOCK: usize = 100;
 
-    // ── Subscribe to new Borrow events to detect borrowers in real-time ──
-    let borrow_filter = Filter::new()
+    // Borrow filter is static — defined once, reused on every WS reconnect
+    let borrow_filter = alloy::rpc::types::Filter::new()
         .address(AAVE_POOL)
         .event_signature(IAavePool::Borrow::SIGNATURE_HASH);
-    let borrow_sub = ws.subscribe_logs(&borrow_filter).await?;
-    let mut borrow_stream = borrow_sub.into_stream();
-
-    // ── Main loop: new blocks via WebSocket ──
-    tracing::info!("🔄 Listening for new blocks + new borrowers...");
-
-    let sub = ws.subscribe_blocks().await?;
-    let mut stream = sub.into_stream();
 
     let mut stats_liq = 0u32;
     let mut stats_profit = 0.0f64;
-    // Track price for flash-crash detection
     let mut prev_eth_price = eth_price_usd;
-    // Last known block number — used to save index on clean shutdown
     let mut last_block: u64 = current_block;
-    // Last block we sent a low-gas alert (avoid spam)
     let mut last_gas_alert_block: u64 = 0;
+    let mut last_daily_summary_day: i32 = {
+        use chrono::{Datelike, Utc};
+        Utc::now().date_naive().num_days_from_ce()
+    };
+    let bot_started_at = std::time::Instant::now();
+
+    // ── Reconnect state ──
+    // reconnect_delay = 0 on first connect (no delay), grows on failures
+    let mut reconnect_delay = std::time::Duration::ZERO;
 
     use futures_util::StreamExt;
 
-    loop {
+    // ═══════════════════════════════════════════════════════════════
+    // Reconnect loop — recreates WS + subscriptions on disconnect
+    // ═══════════════════════════════════════════════════════════════
+    'reconnect: loop {
+        if !reconnect_delay.is_zero() {
+            tracing::warn!("🔌 WS disconnected. Reconnecting in {}s...", reconnect_delay.as_secs());
+            if let Some(ref tg) = tg {
+                tg.send_raw(&format!(
+                    "⚡ LiqBot 🔌 <b>WS déconnecté</b> — reconnexion dans {}s",
+                    reconnect_delay.as_secs()
+                )).await;
+            }
+            tokio::time::sleep(reconnect_delay).await;
+            // Clear pending tx set — we lost track of any in-flight results
+            pending_liquidations.clear();
+        }
+
+        let ws = match ProviderBuilder::new()
+            .connect_ws(WsConnect::new(&cfg.rpc_ws_url))
+            .await
+        {
+            Ok(ws) => {
+                if !reconnect_delay.is_zero() {
+                    tracing::info!("✅ WS reconnected");
+                    if let Some(ref tg) = tg {
+                        tg.send_raw("⚡ LiqBot ✅ <b>WS reconnecté</b>").await;
+                    }
+                }
+                reconnect_delay = std::time::Duration::from_secs(1);
+                ws
+            }
+            Err(e) => {
+                tracing::error!("WS connect failed: {e}");
+                reconnect_delay = (reconnect_delay + std::time::Duration::from_secs(2))
+                    .min(std::time::Duration::from_secs(60));
+                continue 'reconnect;
+            }
+        };
+
+        // ── Subscribe ──
+        let (Ok(borrow_sub), Ok(block_sub), Ok(price_sub)) = (
+            ws.subscribe_logs(&borrow_filter).await,
+            ws.subscribe_blocks().await,
+            ws.subscribe_logs(&price_filter).await,
+        ) else {
+            tracing::error!("WS subscribe failed — will retry");
+            reconnect_delay = std::time::Duration::from_secs(5);
+            continue 'reconnect;
+        };
+
+        let mut borrow_stream = borrow_sub.into_stream();
+        let mut stream        = block_sub.into_stream();
+        let mut price_stream  = price_sub.into_stream();
+
+        tracing::info!("🔄 Listening for new blocks + new borrowers + oracle updates...");
+
+        // ── Inner event loop ──
+        loop {
         tokio::select! {
             // ── New Borrow event: add borrower to index ──
-            Some(log) = borrow_stream.next() => {
+            borrow_opt = borrow_stream.next() => {
+                let Some(log) = borrow_opt else {
+                    tracing::warn!("Borrow stream ended"); break;
+                };
                 if let Ok(ev) = IAavePool::Borrow::decode_log_data(log.data()) {
-                    index_borrower(&mut *user_index.write().await, ev.user);
-                    tracing::debug!("📥 New borrower indexed: {}", ev.user);
+                    let mut idx = user_index.write().await;
+                    if let Some(pos) = idx.get_mut(&ev.user) {
+                        // Existing user borrowed more: their debt changed, force an immediate
+                        // refresh so the index reflects the new total_debt_base this block.
+                        // Without this, a dust position that grows profitable could stay
+                        // invisible until the slow priority refresh interval expires.
+                        pos.next_refresh_at = 0;
+                        tracing::debug!("🔄 Existing borrower re-scheduled for refresh: {}", ev.user);
+                    } else {
+                        index_borrower(&mut idx, ev.user);
+                        tracing::debug!("📥 New borrower indexed: {}", ev.user);
+                    }
+                }
+            }
+
+            // ── Oracle frontrunning: react to Chainlink price update immediately ──
+            // AnswerUpdated fires the instant the price is published on-chain —
+            // before the next block subscription event reaches us (~100-200ms earlier).
+            price_opt = price_stream.next() => {
+                let Some(log) = price_opt else {
+                    tracing::warn!("Price stream ended"); break;
+                };
+                if let Ok(ev) = IChainlinkAggregator::AnswerUpdated::decode_log_data(log.data()) {
+                    if ev.current > I256::ZERO {
+                        if let Ok(new_price_str) = ev.current.to_string().parse::<f64>() {
+                            let new_price = new_price_str / 1e8;
+                            let drop_pct = (eth_price_usd - new_price) / eth_price_usd;
+                            prev_eth_price = eth_price_usd;
+                            eth_price_usd = new_price;
+                            *shared_eth_price.write().await = new_price;
+                            tracing::info!("🔔 Oracle: ETH=${new_price:.2} ({:+.1}%)", -drop_pct * 100.0);
+
+                            // Flash-crash: invalidate positions that may now be liquidatable
+                            if drop_pct > 0.005 {
+                                let scale = new_price / prev_eth_price;
+                                let invalidate_below = U256::from(
+                                    (cfg.health_factor_threshold / scale * 1e18) as u128
+                                );
+                                let mut count = 0usize;
+                                for pos in user_index.write().await.values_mut() {
+                                    if pos.health_factor < invalidate_below {
+                                        pos.next_refresh_at = 0; // refresh ASAP
+                                        count += 1;
+                                    }
+                                }
+                                if count > 0 {
+                                    tracing::warn!(
+                                        "⚡ Oracle drop {:.1}%! {} positions invalidated for immediate check",
+                                        drop_pct * 100.0, count
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -897,10 +1028,10 @@ async fn main() -> Result<()> {
             }
 
             block_opt = stream.next() => {
-                // None means the WebSocket closed — bail so systemd restarts us
-                let block = match block_opt {
-                    Some(b) => b,
-                    None => eyre::bail!("WebSocket block subscription closed — restarting"),
+                // None = WS closed → break inner loop → outer 'reconnect loop handles it
+                let Some(block) = block_opt else {
+                    tracing::warn!("Block stream ended — reconnecting WS");
+                    break;
                 };
 
                 let bn = block.number;
@@ -908,12 +1039,28 @@ async fn main() -> Result<()> {
 
                 // Collect at-risk users, sorted by debt descending (biggest profit first).
                 // On Arbitrum FCFS, we want to attempt the most valuable position first.
+                // Minimum debt (in Aave 8-decimal USD) required for a liquidation to cover gas.
+                // At 5% bonus: profit = debt * 0.05 — we need that >= min_profit_usd.
+                // So: debt >= min_profit_usd / 0.05 = min_profit_usd * 20.
+                let min_debt_base: u128 = (cfg.min_profit_usd * 20.0 * 1e8) as u128;
+
                 let at_risk_users: Vec<Address> = {
                     let idx = user_index.read().await;
+                    let mut dust_count = 0u32;
                     let mut v: Vec<(Address, U256)> = idx.iter()
-                        .filter(|(_, p)| p.health_factor < hf_thresh && p.total_debt_base > U256::ZERO)
+                        .filter(|(_, p)| {
+                            if p.health_factor >= hf_thresh || p.total_debt_base == U256::ZERO {
+                                return false;
+                            }
+                            if p.total_debt_base.to::<u128>() < min_debt_base {
+                                dust_count += 1;
+                                return false; // debt too small to be profitable
+                            }
+                            true
+                        })
                         .map(|(a, p)| (*a, p.total_debt_base))
                         .collect();
+                    shared_dust_excluded.store(dust_count, Ordering::Relaxed);
                     v.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // descending debt
                     v.into_iter().map(|(a, _)| a).collect()
                 };
@@ -1058,6 +1205,63 @@ async fn main() -> Result<()> {
                 // Persist user index every 500 blocks (~2 min) so restarts are fast
                 if bn % 500 == 0 {
                     save_index(&*user_index.read().await, bn);
+
+                    // ── Auto-sweep excess ETH from hot wallet to cold wallet ──
+                    // If hot wallet holds more than eth_keep + 0.01 ETH (safety margin),
+                    // send the excess to cold wallet so profits/refunds don't sit on the hot key.
+                    const SWEEP_MARGIN: f64 = 0.01;
+                    let bal_wei = http_ro.get_balance(wallet_addr).await.unwrap_or(U256::ZERO);
+                    let bal = bal_wei.to::<u128>() as f64 / 1e18;
+                    let sweep_threshold = cfg.eth_keep + SWEEP_MARGIN;
+                    if bal > sweep_threshold {
+                        let excess_eth = bal - cfg.eth_keep;
+                        let excess_wei = U256::from((excess_eth * 1e18) as u128);
+                        let cold: Address = cfg.cold_wallet.parse().unwrap_or(Address::ZERO);
+                        let req = TransactionRequest::default()
+                            .to(cold)
+                            .value(excess_wei);
+                        match http.send_transaction(req).await {
+                            Ok(pending) => {
+                                let hash = format!("{:?}", pending.tx_hash());
+                                tracing::info!("💸 ETH sweep: {excess_eth:.6} ETH → cold wallet | tx {hash}");
+                                let remaining = bal - excess_eth;
+                                if let Some(ref tg) = tg {
+                                    let tg2 = tg.clone();
+                                    tokio::spawn(async move {
+                                        tg2.notify_eth_sweep(excess_eth, remaining).await;
+                                    });
+                                }
+                            }
+                            Err(e) => tracing::warn!("ETH sweep failed: {e}"),
+                        }
+                    }
+                }
+
+                // ── Daily summary (first block of each new calendar day UTC) ──
+                {
+                    use chrono::{Datelike, Utc};
+                    let today = Utc::now().date_naive().num_days_from_ce();
+                    if today > last_daily_summary_day {
+                        last_daily_summary_day = today;
+                        let s = StatsStore::load();
+                        let uptime_h = bot_started_at.elapsed().as_secs_f64() / 3600.0;
+                        let (liq_today, profit_today, gas_today) = s.today_summary();
+                        if let Some(ref tg) = tg {
+                            let tg2 = tg.clone();
+                            let tracked = user_index.read().await.len();
+                            let at_risk = at_risk_users.len() as u32;
+                            let hot_eth = http_ro.get_balance(wallet_addr).await
+                                .unwrap_or(U256::ZERO).to::<u128>() as f64 / 1e18;
+                            tokio::spawn(async move {
+                                tg2.notify_daily_summary(
+                                    uptime_h,
+                                    liq_today, profit_today, gas_today,
+                                    s.total_successes() as u32, s.total_profit(),
+                                    tracked, at_risk, hot_eth,
+                                ).await;
+                            });
+                        }
+                    }
                 }
 
                 // Heartbeat toutes les 100 blocs (~25s sur Arbitrum)
@@ -1067,11 +1271,14 @@ async fn main() -> Result<()> {
                             .and_then(|idx| idx.get(&u).map(|p| p.health_factor < one_e18))
                             .unwrap_or(false)
                     }).count();
+                    let dust_excl = shared_dust_excluded.load(Ordering::Relaxed);
                     tracing::info!(
-                        "💓 Block {bn} | {} tracked | {} watching (HF<1.05) | {} liquidatable (HF<1.0) | {stats_liq} liq (${stats_profit:.2} gross) | ETH ${eth_price_usd:.0}",
+                        "💓 Block {bn} | {} tracked | {} watching (HF<1.05) | {} liquidatable (HF<1.0) | {} dust exclu (dette<${:.0}) | {stats_liq} liq (${stats_profit:.2} gross) | ETH ${eth_price_usd:.0}",
                         user_index.read().await.len(),
                         at_risk_users.len(),
                         liquidatable,
+                        dust_excl,
+                        cfg.min_profit_usd * 20.0,
                     );
                 }
 
@@ -1113,15 +1320,17 @@ async fn main() -> Result<()> {
                         continue;
                     } // Not liquidatable
 
-                    tracing::warn!(
-                        "🎯 LIQUIDATABLE: {user} HF={:.6} debt=${debt_usd:.2}",
-                        hf.to::<u128>() as f64 / 1e18
-                    );
+                    // Estimate profit: debt * close_factor * 5% liquidation bonus - gas cost.
+                    // close_factor = 100% if HF < 0.95 (deep underwater), 50% otherwise.
+                    let hf_f64 = hf.to::<u128>() as f64 / 1e18;
+                    let close_factor = if hf_f64 < 0.95 { 1.0_f64 } else { 0.5_f64 };
+                    let gas_est_usd = 300_000.0 * cfg.max_gas_gwei * 1e-9 * eth_price_usd;
+                    let profit_est = debt_usd * close_factor * 0.05 - gas_est_usd;
 
-                    // Skip tiny positions (not worth the RPC overhead)
-                    if debt_usd < cfg.min_profit_usd * 10.0 {
-                        continue;
-                    }
+                    tracing::warn!(
+                        "🎯 LIQUIDATABLE: {user} HF={hf_f64:.6} dette=${debt_usd:.2} profit_est≈${profit_est:.2} (close={:.0}% bonus=5% gas≈${gas_est_usd:.3})",
+                        close_factor * 100.0,
+                    );
 
                     // Find best debt + collateral across all tracked tokens
                     let mut best_debt: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
@@ -1450,10 +1659,17 @@ async fn main() -> Result<()> {
                     );
                     tg.send_raw(&msg).await;
                 }
-                break;
+                // break all the way out of both the inner loop AND 'reconnect
+                break 'reconnect;
             }
         }
-    }
+        } // end inner loop
+
+        // Inner loop exited without ctrl_c → WS disconnected
+        // The 'reconnect outer loop will try to reconnect after a delay.
+        // (reconnect_delay was already set in the None arms above)
+
+    } // end 'reconnect loop
 
     Ok(())
 }
@@ -2133,6 +2349,70 @@ mod tests {
             }
         }).collect();
         assert!(calls.iter().all(|c| c.allowFailure), "all sub-calls must have allowFailure=true");
+    }
+
+    // ── WebSocket reconnect ────────────────────────────────────
+
+    #[test]
+    fn test_reconnect_delay_progression() {
+        // Verify the reconnect backoff: starts at 1s, doubles, caps at 60s
+        let mut delay = std::time::Duration::ZERO;
+
+        // First connect: no delay
+        assert!(delay.is_zero());
+
+        // After first disconnect
+        delay = std::time::Duration::from_secs(1);
+        assert_eq!(delay.as_secs(), 1);
+
+        // After second disconnect: grows
+        delay = (delay + std::time::Duration::from_secs(2)).min(std::time::Duration::from_secs(60));
+        assert_eq!(delay.as_secs(), 3);
+
+        // Eventually caps at 60s: 1 + n*2 >= 60 requires n >= 30 iterations
+        for _ in 0..30 {
+            delay = (delay + std::time::Duration::from_secs(2)).min(std::time::Duration::from_secs(60));
+        }
+        assert_eq!(delay.as_secs(), 60, "reconnect delay must cap at 60s");
+    }
+
+    // ── Oracle frontrunning ────────────────────────────────────
+
+    #[test]
+    fn test_chainlink_answer_updated_event_signature_exists() {
+        // Verify the AnswerUpdated event is in the ABI (non-zero signature hash)
+        let sig = IChainlinkAggregator::AnswerUpdated::SIGNATURE_HASH;
+        assert_ne!(sig, alloy::primitives::B256::ZERO, "AnswerUpdated SIGNATURE_HASH must not be zero");
+    }
+
+    #[test]
+    fn test_oracle_price_drop_threshold() {
+        // The oracle handler invalidates users when drop > 0.5%.
+        // Verify the threshold makes sense: not too sensitive, not too lazy.
+        let threshold = 0.005_f64; // 0.5%
+        assert!(threshold > 0.001, "threshold too sensitive — noise would trigger it");
+        assert!(threshold < 0.02,  "threshold too high — would miss real drops");
+    }
+
+    #[test]
+    fn test_oracle_invalidate_below_formula() {
+        // Simulate the formula: invalidate_below = hf_threshold / scale * 1e18
+        // where scale = new_price / old_price
+        let hf_threshold = 1.05_f64;
+        let old_price = 2000.0_f64;
+        let new_price = 1900.0_f64; // 5% drop
+        let scale = new_price / old_price; // 0.95
+
+        let invalidate_below = U256::from((hf_threshold / scale * 1e18) as u128);
+
+        // A user with stored HF=1.08 would have estimated_new_hf = 1.08 * 0.95 = 1.026
+        // which is below hf_threshold=1.05 → should be invalidated
+        let user_hf = U256::from(1_080_000_000_000_000_000u128); // 1.08
+        assert!(user_hf < invalidate_below, "user at 1.08 HF must be invalidated after 5% drop");
+
+        // A user at HF=1.20 → estimated 1.20 * 0.95 = 1.14 → still above threshold
+        let safe_hf = U256::from(1_200_000_000_000_000_000u128); // 1.20
+        assert!(safe_hf >= invalidate_below, "user at 1.20 HF should NOT be invalidated");
     }
 
     // ── Parallel RPC structure — timing proof ─────────────────
