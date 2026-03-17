@@ -96,8 +96,8 @@ mod tests {
     }
 
     fn clear_optional() {
-        for key in &["MIN_PROFIT_USD", "MAX_GAS_GWEI", "ETH_KEEP", "HF_THRESHOLD",
-                     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] {
+        for key in &["MIN_PROFIT_USD", "MAX_GAS_GWEI", "ETH_KEEP", "ETH_SWEEP_KEEP",
+                     "HF_THRESHOLD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] {
             std::env::remove_var(key);
         }
     }
@@ -110,7 +110,8 @@ mod tests {
         let cfg = Config::from_env().expect("valid config");
         assert_eq!(cfg.min_profit_usd, 2.0);
         assert_eq!(cfg.max_gas_gwei, 1.0);
-        assert_eq!(cfg.eth_keep, 0.01);
+        assert_eq!(cfg.eth_keep, 0.005);
+        assert_eq!(cfg.eth_sweep_keep, 0.03);
         assert_eq!(cfg.health_factor_threshold, 1.05);
         assert!(cfg.telegram_token.is_empty());
     }
@@ -121,12 +122,14 @@ mod tests {
         set_required();
         std::env::set_var("MIN_PROFIT_USD", "5");
         std::env::set_var("MAX_GAS_GWEI", "2.5");
-        std::env::set_var("ETH_KEEP", "0.05");
+        std::env::set_var("ETH_KEEP", "0.005");
+        std::env::set_var("ETH_SWEEP_KEEP", "0.05");
         std::env::set_var("HF_THRESHOLD", "1.10");
         let cfg = Config::from_env().expect("valid config");
         assert_eq!(cfg.min_profit_usd, 5.0);
         assert_eq!(cfg.max_gas_gwei, 2.5);
-        assert_eq!(cfg.eth_keep, 0.05);
+        assert_eq!(cfg.eth_keep, 0.005);
+        assert_eq!(cfg.eth_sweep_keep, 0.05);
         assert_eq!(cfg.health_factor_threshold, 1.10);
         clear_optional();
     }
