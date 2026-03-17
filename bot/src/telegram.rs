@@ -302,6 +302,7 @@ impl TelegramNotifier {
         hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
         hf_threshold: f64,
         min_profit_usd: f64,
+        max_gas_gwei: f64,
         dust_excluded: Arc<std::sync::atomic::AtomicU32>,
         eth_balance: Arc<tokio::sync::RwLock<f64>>,
         eth_price: Arc<tokio::sync::RwLock<f64>>,
@@ -457,34 +458,65 @@ impl TelegramNotifier {
 
                     "/hf" => {
                         let list = hf_list.read().await;
-                        let dust = dust_excluded.load(std::sync::atomic::Ordering::Relaxed);
+                        let dust  = dust_excluded.load(std::sync::atomic::Ordering::Relaxed);
+                        let eth_p = *eth_price.read().await;
                         let min_debt_usd = min_profit_usd * 20.0;
+
                         if list.is_empty() && dust == 0 {
-                            let msg = format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name);
-                            self.send(&msg).await;
+                            self.send(&format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name)).await;
                         } else {
+                            let red:    Vec<_> = list.iter().filter(|(_, hf, _)| *hf < 1.0).collect();
+                            let yellow: Vec<_> = list.iter().filter(|(_, hf, _)| *hf >= 1.0).collect();
+
+                            let gas_est_usd = 300_000.0 * max_gas_gwei * 1e-9 * eth_p;
+
                             let mut msg = format!(
                                 "{} 🔍 <b>{} positions à risque</b> (HF &lt; {:.2})\n",
                                 self.bot_name, list.len(), hf_threshold,
                             );
-                            msg.push_str("<pre>      HF      Dette      Adresse\n");
-                            for (addr, hf, debt) in list.iter().take(30) {
-                                let danger = if *hf < 1.0 { "🔴" } else { "🟡" };
-                                let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
-                                msg.push_str(&format!(
-                                    "{} {:.4}  {:>10.2} $  {}\n",
-                                    danger, hf, debt, short,
-                                ));
+
+                            // ── 🔴 Section: liquidatables avec profit estimé ──
+                            if !red.is_empty() {
+                                msg.push_str(&format!("\n🔴 <b>{} liquidatable{}</b> maintenant\n",
+                                    red.len(), if red.len() > 1 { "s" } else { "" }));
+                                msg.push_str("<pre>");
+                                msg.push_str("   HF      Dette    Profit est.   Adresse\n");
+                                for (addr, hf, debt) in red.iter().take(10) {
+                                    let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
+                                    let close = if *hf < 0.95 { 1.0_f64 } else { 0.5_f64 };
+                                    let profit = debt * close * 0.05 - gas_est_usd;
+                                    msg.push_str(&format!(
+                                        "{:.4}  {:>8.0} $  {:>+8.0} $  {}\n",
+                                        hf, debt, profit, short,
+                                    ));
+                                }
+                                msg.push_str("</pre>");
                             }
-                            msg.push_str("</pre>");
-                            if list.len() > 30 {
-                                msg.push_str(&format!("<i>+{} autres non affichées</i>\n", list.len() - 30));
+
+                            // ── 🟡 Section: surveillance ──
+                            if !yellow.is_empty() {
+                                msg.push_str(&format!("\n🟡 <b>{} en surveillance</b>\n", yellow.len()));
+                                msg.push_str("<pre>");
+                                msg.push_str("      HF       Dette      Adresse\n");
+                                for (addr, hf, debt) in yellow.iter().take(20) {
+                                    let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
+                                    msg.push_str(&format!(
+                                        "{:.4}  {:>10.2} $  {}\n",
+                                        hf, debt, short,
+                                    ));
+                                }
+                                if yellow.len() > 20 {
+                                    msg.push_str(&format!("+{} autres…", yellow.len() - 20));
+                                }
+                                msg.push_str("</pre>");
                             }
+
                             if dust > 0 {
                                 msg.push_str(&format!(
-                                    "⚫ <i>{dust} position(s) ignorée(s) volontairement (dette &lt; ${min_debt_usd:.0} — non rentable à 5% bonus)</i>"
+                                    "\n⚫ <i>{dust} ignorée(s) — dette &lt; ${min_debt_usd:.0} (non rentable)</i>"
                                 ));
                             }
+
                             self.send(&msg).await;
                         }
                     }

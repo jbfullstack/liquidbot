@@ -9,7 +9,8 @@ pub struct Config {
     pub contract_address: String,
     pub min_profit_usd: f64,
     pub max_gas_gwei: f64,
-    pub eth_keep: f64,
+    pub eth_keep: f64,       // minimum ETH to keep for gas (skip tx if below)
+    pub eth_sweep_keep: f64, // ETH to keep after sweep (must be >= eth_keep)
     pub health_factor_threshold: f64,  // e.g. 1.05 — start watching
     pub telegram_token: String,
     pub telegram_chat_id: String,
@@ -35,8 +36,11 @@ impl Config {
                 .unwrap_or("1".into()).parse()
                 .map_err(|_| eyre!("MAX_GAS_GWEI must be a number"))?,
             eth_keep: std::env::var("ETH_KEEP")
-                .unwrap_or("0.01".into()).parse()
+                .unwrap_or("0.005".into()).parse()
                 .map_err(|_| eyre!("ETH_KEEP must be a number"))?,
+            eth_sweep_keep: std::env::var("ETH_SWEEP_KEEP")
+                .unwrap_or("0.03".into()).parse()
+                .map_err(|_| eyre!("ETH_SWEEP_KEEP must be a number"))?,
             health_factor_threshold: std::env::var("HF_THRESHOLD")
                 .unwrap_or("1.05".into()).parse()
                 .map_err(|_| eyre!("HF_THRESHOLD must be a number"))?,
@@ -58,6 +62,13 @@ impl Config {
         }
         if self.eth_keep < 0.0 {
             return Err(eyre!("ETH_KEEP must be >= 0, got {}", self.eth_keep));
+        }
+        if self.eth_sweep_keep < self.eth_keep {
+            return Err(eyre!(
+                "ETH_SWEEP_KEEP ({}) must be >= ETH_KEEP ({}) — \
+                 the sweep reserve must cover the minimum tx reserve",
+                self.eth_sweep_keep, self.eth_keep
+            ));
         }
         if self.health_factor_threshold < 1.0 {
             return Err(eyre!(

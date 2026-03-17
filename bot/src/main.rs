@@ -572,8 +572,15 @@ async fn main() -> Result<()> {
     tracing::info!("✅ Connected. Flash premium: {premium} bps");
 
     // ── ETH price from Chainlink (same oracle Aave uses) ──
-    let mut eth_price_usd = fetch_eth_price(&http_ro).await?;
-    tracing::info!("💲 ETH price: ${eth_price_usd:.2} (Chainlink)");
+    // Non-fatal: if the RPC rejects the call (e.g. wallet empty → Arbitrum fee simulation),
+    // fall back to a safe default so the bot starts and can alert via Telegram.
+    let mut eth_price_usd = match fetch_eth_price(&http_ro).await {
+        Ok(p) => { tracing::info!("💲 ETH price: ${p:.2} (Chainlink)"); p }
+        Err(e) => {
+            tracing::warn!("⚠️  Chainlink price fetch failed: {e} — using fallback $2000");
+            2000.0
+        }
+    };
 
     // ── Chainlink aggregator address — subscribe to AnswerUpdated on THIS (not proxy) ──
     // The proxy delegates to a phase aggregator; events are emitted by the aggregator.
@@ -590,11 +597,6 @@ async fn main() -> Result<()> {
     let eth_bal = eth_bal_wei.to::<u128>() as f64 / 1e18;
     tracing::info!("✅ ETH balance: {eth_bal:.6}");
 
-    // Warn immediately if ETH balance is already below threshold
-    if eth_bal <= cfg.eth_keep {
-        tracing::warn!("⚠️  ETH balance {eth_bal:.6} <= eth_keep {}. Bot cannot send tx!", cfg.eth_keep);
-    }
-
     // ── Telegram ──
     let tg = if !cfg.telegram_token.is_empty() && !cfg.telegram_chat_id.is_empty() {
         tracing::info!("📱 Telegram notifications enabled");
@@ -603,6 +605,28 @@ async fn main() -> Result<()> {
         tracing::warn!("📱 Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing)");
         None
     };
+
+    // Warn on low ETH — now that Telegram is ready, alert immediately
+    if eth_bal <= cfg.eth_keep {
+        tracing::warn!("⚠️  ETH balance {eth_bal:.6} <= eth_keep {}. Bot ne peut pas envoyer de tx !", cfg.eth_keep);
+        if let Some(ref tg) = tg {
+            let msg = format!(
+                "⚡ LiqBot ⛽ <b>Solde ETH critique au démarrage !</b>\n\
+                \n\
+                Hot wallet: <b>{:.6} ETH</b> (~${:.2})\n\
+                Seuil tx: <b>{:.4} ETH</b> (ETH_KEEP)\n\
+                Réserve sweep: <b>{:.4} ETH</b> (ETH_SWEEP_KEEP)\n\
+                \n\
+                ⚠️ Le bot tourne mais <b>ne peut pas liquider</b>.\n\
+                Recharge le hot wallet sur Arbitrum !",
+                eth_bal,
+                eth_bal * eth_price_usd,
+                cfg.eth_keep,
+                cfg.eth_sweep_keep,
+            );
+            tg.send_raw(&msg).await;
+        }
+    }
 
     // ── Persistent stats ──
     let mut stats = StatsStore::load();
@@ -745,6 +769,7 @@ async fn main() -> Result<()> {
                 hf_ref,
                 cfg.health_factor_threshold,
                 cfg.min_profit_usd,
+                cfg.max_gas_gwei,
                 dust_ref,
                 eth_bal_ref,
                 eth_price_ref,
@@ -1207,14 +1232,16 @@ async fn main() -> Result<()> {
                     save_index(&*user_index.read().await, bn);
 
                     // ── Auto-sweep excess ETH from hot wallet to cold wallet ──
-                    // If hot wallet holds more than eth_keep + 0.01 ETH (safety margin),
-                    // send the excess to cold wallet so profits/refunds don't sit on the hot key.
+                    // Uses eth_sweep_keep (not eth_keep) so the two thresholds are independent:
+                    //   eth_keep       = minimum to attempt a liquidation tx (~0.005 ETH)
+                    //   eth_sweep_keep = gas reserve to keep after sweep    (~0.03 ETH)
+                    // Trigger: bal > eth_sweep_keep + 0.01 margin
                     const SWEEP_MARGIN: f64 = 0.01;
                     let bal_wei = http_ro.get_balance(wallet_addr).await.unwrap_or(U256::ZERO);
                     let bal = bal_wei.to::<u128>() as f64 / 1e18;
-                    let sweep_threshold = cfg.eth_keep + SWEEP_MARGIN;
+                    let sweep_threshold = cfg.eth_sweep_keep + SWEEP_MARGIN;
                     if bal > sweep_threshold {
-                        let excess_eth = bal - cfg.eth_keep;
+                        let excess_eth = bal - cfg.eth_sweep_keep;
                         let excess_wei = U256::from((excess_eth * 1e18) as u128);
                         let cold: Address = cfg.cold_wallet.parse().unwrap_or(Address::ZERO);
                         let req = TransactionRequest::default()
