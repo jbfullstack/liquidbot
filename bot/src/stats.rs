@@ -12,12 +12,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+fn default_protocol() -> String { "Aave V3".to_string() }
+
 const STATS_FILE: &str = "stats.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiqRecord {
     pub timestamp: String,       // ISO 8601
     pub user: String,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,        // e.g. "Aave V3"
     pub debt_token: String,
     pub collateral_token: String,
     pub debt_usd: f64,
@@ -83,6 +87,7 @@ impl StatsStore {
     pub fn record_liquidation(
         &mut self,
         user: &str,
+        protocol: &str,
         debt_token: &str,
         collateral_token: &str,
         debt_usd: f64,
@@ -94,6 +99,7 @@ impl StatsStore {
         self.records.push(LiqRecord {
             timestamp: Utc::now().to_rfc3339(),
             user: user.to_string(),
+            protocol: protocol.to_string(),
             debt_token: debt_token.to_string(),
             collateral_token: collateral_token.to_string(),
             debt_usd,
@@ -151,6 +157,29 @@ impl StatsStore {
                 let month = dt.month();
                 *result.entry(year).or_default().entry(month).or_default() += r.profit_usd;
             }
+        }
+        result
+    }
+
+    /// Aggregate by protocol → (successes, failures, net_profit)
+    /// net = sum(profit for successes) - sum(gas for all)
+    pub fn protocol_breakdown(&self) -> BTreeMap<String, (usize, usize, f64)> {
+        let mut result: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+        for r in &self.records {
+            let e = result.entry(r.protocol.clone()).or_insert((0, 0, 0.0));
+            if r.success { e.0 += 1; e.2 += r.profit_usd; } else { e.1 += 1; }
+            e.2 -= r.gas_usd;
+        }
+        result
+    }
+
+    /// Aggregate by debt token → (successes, failures, net_profit)
+    pub fn token_breakdown(&self) -> BTreeMap<String, (usize, usize, f64)> {
+        let mut result: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+        for r in &self.records {
+            let e = result.entry(r.debt_token.clone()).or_insert((0, 0, 0.0));
+            if r.success { e.0 += 1; e.2 += r.profit_usd; } else { e.1 += 1; }
+            e.2 -= r.gas_usd;
         }
         result
     }
@@ -234,6 +263,28 @@ impl StatsStore {
             lines.push(format!("　/an: ${yearly_proj:.2}"));
         }
 
+        // Protocol breakdown
+        let proto_bd = self.protocol_breakdown();
+        if !proto_bd.is_empty() {
+            lines.push(String::new());
+            lines.push("🏛️ <b>Par protocole</b>".to_string());
+            for (proto, (ok, fail, net)) in &proto_bd {
+                lines.push(format!("　{proto}: ✅{ok} ❌{fail}  ${net:.2}"));
+            }
+        }
+
+        // Token breakdown (top 5 by net profit)
+        let token_bd = self.token_breakdown();
+        if !token_bd.is_empty() {
+            lines.push(String::new());
+            lines.push("🪙 <b>Par token (dette)</b>".to_string());
+            let mut token_vec: Vec<_> = token_bd.iter().collect();
+            token_vec.sort_by(|a, b| b.1.2.partial_cmp(&a.1.2).unwrap_or(std::cmp::Ordering::Equal));
+            for (token, (ok, fail, net)) in token_vec.iter().take(5) {
+                lines.push(format!("　{token}: ✅{ok} ❌{fail}  ${net:.2}"));
+            }
+        }
+
         lines.join("\n")
     }
 }
@@ -247,6 +298,7 @@ mod tests {
         LiqRecord {
             timestamp: "2025-01-15T10:00:00+00:00".to_string(),
             user: "0xuser".to_string(),
+            protocol: "Aave V3".to_string(),
             debt_token: "USDC".to_string(),
             collateral_token: "WETH".to_string(),
             debt_usd: 1000.0,

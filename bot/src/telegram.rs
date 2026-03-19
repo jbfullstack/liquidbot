@@ -299,7 +299,7 @@ impl TelegramNotifier {
         at_risk_count: Arc<tokio::sync::RwLock<u32>>,
         bot_active: Arc<AtomicBool>,
         cmd_sender: tokio::sync::mpsc::Sender<TelegramCommand>,
-        hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64)>>>,
+        hf_list: Arc<tokio::sync::RwLock<Vec<(String, f64, f64, String)>>>,
         hf_threshold: f64,
         min_profit_usd: f64,
         max_gas_gwei: f64,
@@ -465,8 +465,8 @@ impl TelegramNotifier {
                         if list.is_empty() && dust == 0 {
                             self.send(&format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name)).await;
                         } else {
-                            let red:    Vec<_> = list.iter().filter(|(_, hf, _)| *hf < 1.0).collect();
-                            let yellow: Vec<_> = list.iter().filter(|(_, hf, _)| *hf >= 1.0).collect();
+                            let red:    Vec<_> = list.iter().filter(|(_, hf, _, _)| *hf < 1.0).collect();
+                            let yellow: Vec<_> = list.iter().filter(|(_, hf, _, _)| *hf >= 1.0).collect();
 
                             let gas_est_usd = 300_000.0 * max_gas_gwei * 1e-9 * eth_p;
 
@@ -480,14 +480,15 @@ impl TelegramNotifier {
                                 msg.push_str(&format!("\n🔴 <b>{} liquidatable{}</b> maintenant\n",
                                     red.len(), if red.len() > 1 { "s" } else { "" }));
                                 msg.push_str("<pre>");
-                                msg.push_str("   HF      Dette    Profit est.   Adresse\n");
-                                for (addr, hf, debt) in red.iter().take(10) {
+                                msg.push_str("   HF      Dette    Profit est.   Adresse    Proto\n");
+                                for (addr, hf, debt, proto) in red.iter().take(10) {
                                     let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
                                     let close = if *hf < 0.95 { 1.0_f64 } else { 0.5_f64 };
                                     let profit = debt * close * 0.05 - gas_est_usd;
+                                    let proto_short = proto.replace("Aave ", "A").replace(" ", "");
                                     msg.push_str(&format!(
-                                        "{:.4}  {:>8.0} $  {:>+8.0} $  {}\n",
-                                        hf, debt, profit, short,
+                                        "{:.4}  {:>8.0} $  {:>+8.0} $  {}  {}\n",
+                                        hf, debt, profit, short, proto_short,
                                     ));
                                 }
                                 msg.push_str("</pre>");
@@ -497,12 +498,13 @@ impl TelegramNotifier {
                             if !yellow.is_empty() {
                                 msg.push_str(&format!("\n🟡 <b>{} en surveillance</b>\n", yellow.len()));
                                 msg.push_str("<pre>");
-                                msg.push_str("      HF       Dette      Adresse\n");
-                                for (addr, hf, debt) in yellow.iter().take(20) {
+                                msg.push_str("      HF       Dette      Adresse    Proto\n");
+                                for (addr, hf, debt, proto) in yellow.iter().take(20) {
                                     let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
+                                    let proto_short = proto.replace("Aave ", "A").replace(" ", "");
                                     msg.push_str(&format!(
-                                        "{:.4}  {:>10.2} $  {}\n",
-                                        hf, debt, short,
+                                        "{:.4}  {:>10.2} $  {}  {}\n",
+                                        hf, debt, short, proto_short,
                                     ));
                                 }
                                 if yellow.len() > 20 {
@@ -539,6 +541,53 @@ impl TelegramNotifier {
                         let _ = cmd_sender.send(TelegramCommand::ResumeContract).await;
                     }
 
+                    "/logs" => {
+                        let n: usize = text.split_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(30)
+                            .min(1000); // cap raisonnable
+                        let service = std::env::var("SERVICE_NAME")
+                            .unwrap_or_else(|_| "liquidator".to_string());
+                        match tokio::process::Command::new("journalctl")
+                            .args(["-u", &service, "-n", &n.to_string(), "--no-pager", "--output=short-precise"])
+                            .output()
+                            .await
+                        {
+                            Ok(out) if !out.stdout.is_empty() => {
+                                self.send_document_bytes(
+                                    &out.stdout,
+                                    &format!("liquidator-logs-{n}.txt"),
+                                    &format!("📋 Dernières {n} lignes — {service}"),
+                                ).await;
+                            }
+                            Ok(_) => {
+                                self.send(&format!(
+                                    "{} ❌ Aucun log trouvé pour <code>{service}</code>.\n\
+                                    Vérifie que <code>SERVICE_NAME</code> est correct dans .env.",
+                                    self.bot_name
+                                )).await;
+                            }
+                            Err(e) => {
+                                self.send(&format!(
+                                    "{} ❌ Erreur journalctl: <code>{}</code>",
+                                    self.bot_name, e
+                                )).await;
+                            }
+                        }
+                    }
+
+                    "/restart" => {
+                        self.send(&format!(
+                            "{} 🔄 <b>Redémarrage en cours...</b>\n\
+                            ⏳ Le bot sera de retour dans ~5 secondes.",
+                            self.bot_name
+                        )).await;
+                        // Le bot se suicide proprement — systemd (Restart=always) le relance.
+                        // Aucun besoin de sudo ni de systemctl depuis le process.
+                        std::process::exit(0);
+                    }
+
                     "/help" | "/start" => {
                         let msg = format!(
                             "{} 📖 <b>Commandes</b>\n\
@@ -552,6 +601,8 @@ impl TelegramNotifier {
                             <b>Contrôle bot:</b>\n\
                             /stop_bot — suspendre les liquidations\n\
                             /start_bot — reprendre les liquidations\n\
+                            /restart — redémarrer le service systemd\n\
+                            /logs [N] — dernières N lignes (défaut 30)\n\
                             \n\
                             <b>Contrôle contrat:</b>\n\
                             /pause_contract — mettre le contrat en pause (on-chain)\n\
@@ -641,6 +692,20 @@ impl TelegramNotifier {
                 .unwrap()
             );
 
+        let _ = self.client.post(&url).multipart(form).send().await;
+    }
+
+    /// Send raw bytes as a Telegram document (used for logs, etc.)
+    async fn send_document_bytes(&self, bytes: &[u8], filename: &str, caption: &str) {
+        let url = format!("https://api.telegram.org/bot{}/sendDocument", self.token);
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.clone())
+            .text("caption", caption.to_string())
+            .part("document", reqwest::multipart::Part::bytes(bytes.to_vec())
+                .file_name(filename.to_string())
+                .mime_str("text/plain")
+                .unwrap()
+            );
         let _ = self.client.post(&url).multipart(form).send().await;
     }
 }

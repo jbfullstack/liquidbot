@@ -180,6 +180,8 @@ struct UserPosition {
     last_block: u64,
     /// Block at which this user should next be refreshed (priority-based).
     next_refresh_at: u64,
+    /// Protocol this position belongs to (e.g. "Aave V3")
+    protocol: String,
 }
 
 type UserIndex = Arc<RwLock<HashMap<Address, UserPosition>>>;
@@ -253,6 +255,7 @@ fn index_borrower(idx: &mut HashMap<Address, UserPosition>, user: Address) {
         total_debt_base: U256::from(1u64), // non-zero placeholder until real fetch
         last_block: 0,
         next_refresh_at: 0, // refresh ASAP (HF=MAX triggers interval=0)
+        protocol: "Aave V3".to_string(),
     });
 }
 
@@ -709,6 +712,7 @@ async fn main() -> Result<()> {
                         total_debt_base: d.totalDebtBase,
                         last_block: current_block,
                         next_refresh_at: current_block + interval,
+                        protocol: "Aave V3".to_string(),
                     });
                 }
             }
@@ -735,8 +739,8 @@ async fn main() -> Result<()> {
     let shared_at_risk   = Arc::new(RwLock::new(at_risk));
     let shared_eth_bal   = Arc::new(RwLock::new(eth_bal));
     let shared_eth_price = Arc::new(RwLock::new(eth_price_usd));
-    // Snapshot of at-risk positions for /hf command: (address, hf, debt_usd), sorted HF asc
-    let shared_hf_list: Arc<RwLock<Vec<(String, f64, f64)>>> = Arc::new(RwLock::new(Vec::new()));
+    // Snapshot of at-risk positions for /hf command: (address, hf, debt_usd, protocol), sorted HF asc
+    let shared_hf_list: Arc<RwLock<Vec<(String, f64, f64, String)>>> = Arc::new(RwLock::new(Vec::new()));
     // Count of HF<threshold positions excluded from tracking because debt is too small to be profitable
     let shared_dust_excluded: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
@@ -1216,11 +1220,11 @@ async fn main() -> Result<()> {
                 *shared_tracked.write().await = user_index.read().await.len();
                 {
                     let idx = user_index.read().await;
-                    let mut snapshot: Vec<(String, f64, f64)> = at_risk_users.iter()
+                    let mut snapshot: Vec<(String, f64, f64, String)> = at_risk_users.iter()
                         .filter_map(|addr| idx.get(addr).map(|p| {
-                            let hf  = p.health_factor.saturating_to::<u128>() as f64 / 1e18;
+                            let hf   = p.health_factor.saturating_to::<u128>() as f64 / 1e18;
                             let debt = p.total_debt_base.saturating_to::<u128>() as f64 / 1e8;
-                            (format!("{addr}"), hf, debt)
+                            (format!("{addr}"), hf, debt, p.protocol.clone())
                         }))
                         .collect();
                     snapshot.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // HF asc
@@ -1535,6 +1539,7 @@ async fn main() -> Result<()> {
                                     // Record GROSS profit — stats.rs subtracts gas separately
                                     stats.record_liquidation(
                                         &format!("{user}"),
+                                        "Aave V3",
                                         best_debt.2,
                                         best_coll.2,
                                         debt_usd,
@@ -1594,6 +1599,7 @@ async fn main() -> Result<()> {
 
                                     stats.record_liquidation(
                                         &format!("{user}"),
+                                        "Aave V3",
                                         best_debt.2,
                                         best_coll.2,
                                         debt_usd,
@@ -1828,6 +1834,7 @@ mod tests {
             total_debt_base: U256::from(debt),
             last_block: 0,
             next_refresh_at: 0,
+            protocol: "Aave V3".to_string(),
         }
     }
 
