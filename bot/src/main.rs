@@ -260,6 +260,17 @@ pub struct MissedEvent {
     pub debt_asset:   String,
     /// Full 0x address of collateral token (for offline analysis)
     pub col_asset:    String,
+    /// Block where we last refreshed this user's HF (0 if untracked)
+    pub trigger_block: u64,
+    /// Blocks between our last HF check and the competitor's liquidation block
+    /// (liq_block - trigger_block; 0 for untracked)
+    pub block_delta:   u64,
+    /// Competitor's tx position within their block — enriched async during flush (None until then)
+    pub tx_index:      Option<u32>,
+    /// Approx ms we were behind: block_delta × 250 (Arbitrum avg block time). None for untracked.
+    pub ms_delta:      Option<i64>,
+    /// Race analysis: "SUB_BLOCK" | "ORACLE_FRONT_RUN" | "BORDERLINE" | "BEATABLE" | "BLIND_SPOT"
+    pub verdict:       String,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -341,6 +352,49 @@ fn remove_if_repaid(idx: &mut HashMap<Address, UserPosition>, user: &Address, to
     if total_debt_base == U256::ZERO {
         idx.remove(user);
         tracing::debug!("🗑️  Removed repaid borrower {user}");
+    }
+}
+
+/// Classify how far behind we were when a competitor beat us to a liquidation.
+///
+/// | block_delta | verdict         | interpretation                                    |
+/// |-------------|-----------------|---------------------------------------------------|
+/// | 0           | SUB_BLOCK       | Same block — oracle frontrun or much faster bot   |
+/// | 1           | BORDERLINE      | One block gap (~250 ms) — might be beatable       |
+/// | ≥2          | BEATABLE        | Two+ blocks — we had the info, lost on latency    |
+///
+/// Enriched later: if block_delta=0 and tx_index=0 → upgraded to ORACLE_FRONT_RUN.
+fn compute_verdict(block_delta: u64) -> &'static str {
+    match block_delta {
+        0 => "SUB_BLOCK",
+        1 => "BORDERLINE",
+        _ => "BEATABLE",
+    }
+}
+
+/// Enrich a batch of missed events with the competitor's tx index within their block.
+/// Called inline during the 8s flush window — safe to await (not on the hot path).
+/// On timeout or RPC error, tx_index stays None and verdict is unchanged.
+async fn enrich_missed_events<P: Provider>(
+    events: &mut Vec<MissedEvent>,
+    provider: &P,
+) {
+    for ev in events.iter_mut() {
+        if ev.untracked || ev.tx_hash.is_empty() { continue; }
+        let Ok(hash) = ev.tx_hash.parse::<alloy::primitives::B256>() else { continue; };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            provider.get_transaction_by_hash(hash),
+        ).await {
+            Ok(Ok(Some(tx))) => {
+                ev.tx_index = tx.transaction_index.map(|v| v as u32);
+                // Refine sub-block verdict: tx at position 0 = oracle frontrunner
+                if ev.block_delta == 0 && ev.tx_index == Some(0) {
+                    ev.verdict = "ORACLE_FRONT_RUN".to_string();
+                }
+            }
+            _ => {} // timeout or RPC error — keep None, verdict unchanged
+        }
     }
 }
 
@@ -1201,8 +1255,21 @@ async fn main() -> Result<()> {
                 };
                 if let Ok(ev) = IAavePool::LiquidationCall::decode_log_data(log.data()) {
                     let protocol = if log.address() == RADIANT_POOL { "RDT" } else { "AV3" };
-                    let is_ours  = ev.liquidator == wallet_addr;
-                    let tracked  = user_index.read().await.contains_key(&ev.user);
+                    let is_ours = ev.liquidator == wallet_addr;
+
+                    // Read position data BEFORE removal — last_hf and trigger_block
+                    // would be lost if we removed first (bug fix: was always 0.0 before).
+                    let (tracked, last_hf, trigger_block) = {
+                        let idx = user_index.read().await;
+                        match idx.get(&ev.user) {
+                            Some(pos) => (
+                                true,
+                                pos.health_factor.to::<u128>() as f64 / 1e18,
+                                pos.last_block,
+                            ),
+                            None => (false, 0.0, 0u64),
+                        }
+                    };
 
                     // Remove from index — position is now closed
                     if tracked {
@@ -1232,38 +1299,46 @@ async fn main() -> Result<()> {
                             .map(|(_, s, _)| *s)
                             .unwrap_or("???");
 
-                        // Retrieve our last known HF for this user (already removed above)
-                        // We read it before the remove; use 0 as fallback if already gone.
-                        let last_hf = {
-                            let idx = user_index.read().await;
-                            idx.get(&ev.user)
-                                .map(|p| p.health_factor.to::<u128>() as f64 / 1e18)
-                                .unwrap_or(0.0)
-                        };
                         let est_profit = debt_amt * 0.05; // ~5% liquidation bonus
+                        let liq_block   = log.block_number.unwrap_or(0);
+                        // trigger_block = 0 means the position was indexed but the HF was
+                        // never fetched (e.g. loaded from disk at startup, liquidated before
+                        // first refresh). In that case there is no meaningful delta.
+                        let block_delta = if trigger_block == 0 {
+                            0
+                        } else {
+                            liq_block.saturating_sub(trigger_block)
+                        };
+                        let verdict  = compute_verdict(block_delta).to_string();
+                        let ms_delta = Some((block_delta as i64).saturating_mul(250));
 
                         tracing::warn!(
-                            "😢 Missed [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.4} {debt_sym} col={col_sym} hf={last_hf:.4}",
+                            "😢 Missed [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.4} {debt_sym} col={col_sym} hf={last_hf:.4} verdict={verdict} Δ{block_delta}blk",
                             ev.user, ev.liquidator
                         );
 
                         // Push to buffer — will be flushed as one Telegram message after 8s
                         missed_buffer.push(MissedEvent {
-                            user:         format!("{}", ev.user),
-                            liquidator:   format!("{}", ev.liquidator),
-                            debt_sym:     debt_sym.to_string(),
+                            user:          format!("{}", ev.user),
+                            liquidator:    format!("{}", ev.liquidator),
+                            debt_sym:      debt_sym.to_string(),
                             debt_amt,
-                            col_sym:      col_sym.to_string(),
-                            protocol:     protocol.to_string(),
-                            tx_hash:      log.transaction_hash
-                                              .map(|h| format!("{h}"))
-                                              .unwrap_or_default(),
+                            col_sym:       col_sym.to_string(),
+                            protocol:      protocol.to_string(),
+                            tx_hash:       log.transaction_hash
+                                               .map(|h| format!("{h}"))
+                                               .unwrap_or_default(),
                             last_hf,
                             est_profit,
-                            untracked:    false,
-                            block_number: log.block_number.unwrap_or(0),
-                            debt_asset:   format!("{}", ev.debtAsset),
-                            col_asset:    format!("{}", ev.collateralAsset),
+                            untracked:     false,
+                            block_number:  liq_block,
+                            debt_asset:    format!("{}", ev.debtAsset),
+                            col_asset:     format!("{}", ev.collateralAsset),
+                            trigger_block,
+                            block_delta,
+                            tx_index:      None, // enriched async during flush
+                            ms_delta,
+                            verdict,
                         });
                         // Arm the flush timer on the FIRST event of a new batch (don't reset)
                         if flush_deadline.is_none() {
@@ -1285,21 +1360,26 @@ async fn main() -> Result<()> {
                             ev.user, ev.liquidator
                         );
                         missed_buffer.push(MissedEvent {
-                            user:         format!("{}", ev.user),
-                            liquidator:   format!("{}", ev.liquidator),
-                            debt_sym:     debt_sym.to_string(),
+                            user:          format!("{}", ev.user),
+                            liquidator:    format!("{}", ev.liquidator),
+                            debt_sym:      debt_sym.to_string(),
                             debt_amt,
-                            col_sym:      col_sym.to_string(),
-                            protocol:     protocol.to_string(),
-                            tx_hash:      log.transaction_hash
-                                              .map(|h| format!("{h}"))
-                                              .unwrap_or_default(),
-                            last_hf:      0.0,
+                            col_sym:       col_sym.to_string(),
+                            protocol:      protocol.to_string(),
+                            tx_hash:       log.transaction_hash
+                                               .map(|h| format!("{h}"))
+                                               .unwrap_or_default(),
+                            last_hf:       0.0,
                             est_profit,
-                            untracked:    true,
-                            block_number: log.block_number.unwrap_or(0),
-                            debt_asset:   format!("{}", ev.debtAsset),
-                            col_asset:    format!("{}", ev.collateralAsset),
+                            untracked:     true,
+                            block_number:  log.block_number.unwrap_or(0),
+                            debt_asset:    format!("{}", ev.debtAsset),
+                            col_asset:     format!("{}", ev.collateralAsset),
+                            trigger_block: 0,
+                            block_delta:   0,
+                            tx_index:      None,
+                            ms_delta:      None,
+                            verdict:       "BLIND_SPOT".to_string(),
                         });
                         if flush_deadline.is_none() {
                             flush_deadline = Some(
@@ -1338,7 +1418,8 @@ async fn main() -> Result<()> {
                         labels
                     };
 
-                    // Append raw records to missed.json (unified view, includes untracked)
+                    // Append raw records to missed.json — block_delta + verdict already set.
+                    // tx_index may still be None (enriched in background task below).
                     let mut missed_log = competitors::MissedLog::load();
                     missed_log.append_batch(&batch, &labels);
 
@@ -1347,9 +1428,15 @@ async fn main() -> Result<()> {
                     // To find WHY a user wasn't indexed: look up their Borrow event before `block`.
                     competitors::UntrackedLog::load().append_batch(&batch);
 
+                    // Telegram notification + RPC enrichment in a background task.
+                    // enrich_missed_events() makes one get_transaction_by_hash call per tracked
+                    // event — moved off the hot path so the main select! loop is never blocked.
                     if let Some(tg2) = tg.clone() {
+                        let http_ro2 = http_ro.clone();
                         tokio::spawn(async move {
-                            tg2.notify_missed_batch(&batch, &labels).await;
+                            let mut enriched = batch;
+                            enrich_missed_events(&mut enriched, &http_ro2).await;
+                            tg2.notify_missed_batch(&enriched, &labels).await;
                         });
                     }
                 }
@@ -2976,5 +3063,80 @@ mod tests {
         assert_eq!(protocol_data_provider("Aave V3"),    AAVE_DATA_PROVIDER);
         assert_eq!(protocol_data_provider("Radiant V2"), RADIANT_DATA_PROVIDER);
         assert_ne!(RADIANT_DATA_PROVIDER, AAVE_DATA_PROVIDER);
+    }
+
+    // ── compute_verdict ───────────────────────────────────────
+
+    #[test]
+    fn test_verdict_sub_block_on_delta_zero() {
+        assert_eq!(compute_verdict(0), "SUB_BLOCK");
+    }
+
+    #[test]
+    fn test_verdict_borderline_on_delta_one() {
+        assert_eq!(compute_verdict(1), "BORDERLINE");
+    }
+
+    #[test]
+    fn test_verdict_beatable_on_delta_two() {
+        assert_eq!(compute_verdict(2), "BEATABLE");
+    }
+
+    #[test]
+    fn test_verdict_beatable_on_large_delta() {
+        assert_eq!(compute_verdict(100), "BEATABLE");
+    }
+
+    #[test]
+    fn test_missed_event_ms_delta_is_block_delta_times_250() {
+        // ms_delta = block_delta * 250 (Arbitrum avg block time)
+        let deltas = [(0u64, 0i64), (1, 250), (4, 1000), (10, 2500)];
+        for (block_delta, expected_ms) in deltas {
+            let ms = (block_delta as i64).saturating_mul(250);
+            assert_eq!(ms, expected_ms,
+                "block_delta={block_delta} should give {expected_ms}ms");
+        }
+    }
+
+    #[test]
+    fn test_missed_event_untracked_has_blind_spot_verdict() {
+        // Untracked events must always carry BLIND_SPOT verdict and zeroed blocks
+        let ev = MissedEvent {
+            user:          "0xuser".to_string(),
+            liquidator:    "0xliq".to_string(),
+            debt_sym:      "USDC".to_string(),
+            debt_amt:      5000.0,
+            col_sym:       "WETH".to_string(),
+            protocol:      "AV3".to_string(),
+            tx_hash:       "0xtx".to_string(),
+            last_hf:       0.0,
+            est_profit:    250.0,
+            untracked:     true,
+            block_number:  200_000,
+            debt_asset:    "0xUSDC".to_string(),
+            col_asset:     "0xWETH".to_string(),
+            trigger_block: 0,
+            block_delta:   0,
+            tx_index:      None,
+            ms_delta:      None,
+            verdict:       "BLIND_SPOT".to_string(),
+        };
+        assert_eq!(ev.verdict, "BLIND_SPOT");
+        assert_eq!(ev.trigger_block, 0);
+        assert!(ev.ms_delta.is_none());
+    }
+
+    #[test]
+    fn test_missed_event_tracked_has_trigger_block() {
+        // Tracked event: block_delta = liq_block - trigger_block
+        let trigger_block = 999_998u64;
+        let liq_block     = 1_000_000u64;
+        let block_delta   = liq_block.saturating_sub(trigger_block); // 2
+        let verdict       = compute_verdict(block_delta);
+        let ms_delta      = (block_delta as i64).saturating_mul(250); // 500ms
+
+        assert_eq!(block_delta, 2);
+        assert_eq!(verdict, "BEATABLE");
+        assert_eq!(ms_delta, 500);
     }
 }

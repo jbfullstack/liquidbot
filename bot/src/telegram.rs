@@ -289,6 +289,23 @@ impl TelegramNotifier {
                 if !is_top || n == 1 {
                     lines.push_str(&format!("\n   ⚔️ {lbl} <code>{}</code>", e.liquidator));
                 }
+                // Latency verdict line
+                let verdict_icon = match e.verdict.as_str() {
+                    "ORACLE_FRONT_RUN" => "🔮",
+                    "SUB_BLOCK"        => "⚡",
+                    "BORDERLINE"       => "⚠️",
+                    _                  => "🎯", // BEATABLE
+                };
+                let tx_pos = e.tx_index
+                    .map(|i| format!(" tx#{i}"))
+                    .unwrap_or_default();
+                let ms_str = e.ms_delta
+                    .map(|ms| if ms == 0 { " <250ms".to_string() } else { format!(" ~{ms}ms") })
+                    .unwrap_or_default();
+                lines.push_str(&format!(
+                    "\n   {verdict_icon} <b>{}</b> · Δ{}blk{ms_str}{tx_pos}",
+                    e.verdict, e.block_delta,
+                ));
             }
         }
 

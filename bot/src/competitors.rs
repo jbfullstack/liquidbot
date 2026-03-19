@@ -202,6 +202,21 @@ pub struct MissedRecord {
     /// Block where the liquidation landed (0 if unavailable)
     #[serde(default)]
     pub block_number: u64,
+    /// Block where we last refreshed this user's HF before the liquidation (0 if untracked)
+    #[serde(default)]
+    pub trigger_block: u64,
+    /// Number of blocks between our last HF check and the competitor's liquidation block
+    #[serde(default)]
+    pub block_delta:   u64,
+    /// Competitor's tx index within their block (None until enriched, or if RPC failed)
+    #[serde(default)]
+    pub tx_index:      Option<u32>,
+    /// Approx ms we were behind (block_delta × 250). None for blind spots.
+    #[serde(default)]
+    pub ms_delta:      Option<i64>,
+    /// Race analysis: "SUB_BLOCK" | "ORACLE_FRONT_RUN" | "BORDERLINE" | "BEATABLE" | "BLIND_SPOT"
+    #[serde(default)]
+    pub verdict:       String,
 }
 
 /// Append-only log of every missed liquidation event.
@@ -237,19 +252,24 @@ impl MissedLog {
         for ev in events {
             let label = labels.get(&ev.liquidator).cloned().unwrap_or_default();
             self.records.push(MissedRecord {
-                timestamp:  now.clone(),
-                user:       ev.user.clone(),
-                liquidator: ev.liquidator.clone(),
+                timestamp:    now.clone(),
+                user:         ev.user.clone(),
+                liquidator:   ev.liquidator.clone(),
                 label,
-                protocol:   ev.protocol.clone(),
-                debt_sym:   ev.debt_sym.clone(),
-                debt_amt:   ev.debt_amt,
-                col_sym:    ev.col_sym.clone(),
+                protocol:     ev.protocol.clone(),
+                debt_sym:     ev.debt_sym.clone(),
+                debt_amt:     ev.debt_amt,
+                col_sym:      ev.col_sym.clone(),
                 last_hf:      ev.last_hf,
                 est_profit:   ev.est_profit,
                 tx_hash:      ev.tx_hash.clone(),
                 untracked:    ev.untracked,
                 block_number: ev.block_number,
+                trigger_block: ev.trigger_block,
+                block_delta:   ev.block_delta,
+                tx_index:      ev.tx_index,
+                ms_delta:      ev.ms_delta,
+                verdict:       ev.verdict.clone(),
             });
         }
     }
@@ -523,19 +543,24 @@ mod tests {
 
     fn make_missed(liquidator: &str) -> crate::MissedEvent {
         crate::MissedEvent {
-            user:         "0xuser".to_string(),
-            liquidator:   liquidator.to_string(),
-            debt_sym:     "USDC".to_string(),
-            debt_amt:     1000.0,
-            col_sym:      "WETH".to_string(),
-            protocol:     "AV3".to_string(),
-            tx_hash:      "0xtx".to_string(),
-            last_hf:      0.99,
-            est_profit:   50.0,
-            untracked:    false,
-            block_number: 0,
-            debt_asset:   "0xUSDC".to_string(),
-            col_asset:    "0xWETH".to_string(),
+            user:          "0xuser".to_string(),
+            liquidator:    liquidator.to_string(),
+            debt_sym:      "USDC".to_string(),
+            debt_amt:      1000.0,
+            col_sym:       "WETH".to_string(),
+            protocol:      "AV3".to_string(),
+            tx_hash:       "0xtx".to_string(),
+            last_hf:       0.99,
+            est_profit:    50.0,
+            untracked:     false,
+            block_number:  1_000_000,
+            debt_asset:    "0xUSDC".to_string(),
+            col_asset:     "0xWETH".to_string(),
+            trigger_block: 999_999,
+            block_delta:   1,
+            tx_index:      None,
+            ms_delta:      Some(250),
+            verdict:       "BORDERLINE".to_string(),
         }
     }
 
@@ -579,10 +604,12 @@ mod tests {
 
     #[test]
     fn test_missed_log_total_profit() {
+        // Use append_in_memory — append_batch writes to MISSED_FILE which would
+        // pollute the working directory during `cargo test`.
         let events = vec![make_missed("0xaaa"), make_missed("0xbbb")];
         let labels = std::collections::HashMap::new();
         let mut log = MissedLog::default();
-        log.append_batch(&events, &labels);
+        log.append_in_memory(&events, &labels);
         assert!((log.total_est_profit() - 100.0).abs() < 1e-9);
     }
 
