@@ -13,3 +13,7 @@ contracts/cache/
 # Runtime data
 bot/stats.json
 bot/stats.json.tmp
+bot/protocols.json
+bot/stats.json
+bot/competitors.json
+bot/missed.json
