@@ -281,14 +281,22 @@ impl TelegramNotifier {
     /// Runs in a separate tokio task, never blocks the main bot.
     ///
     /// Commands:
-    ///   /status           — is the bot alive, uptime, current state
-    ///   /stats            — full P&L summary
-    ///   /json             — sends stats.json as a document
-    ///   /help             — list commands
-    ///   /stop_bot         — pause liquidations (process stays alive)
-    ///   /start_bot        — resume liquidations
-    ///   /pause_contract   — call setPaused(true) on-chain
-    ///   /resume_contract  — call setPaused(false) on-chain
+    ///   /status [s]         — bot alive, uptime, current state
+    ///   /stats [protocol]   — P&L global ou filtré par protocole
+    ///   /hf [protocol]      — positions à risque (filtre protocole optionnel)
+    ///   /protocols          — liste tous les protocoles + statut
+    ///   /enable <id>        — activer un protocole
+    ///   /disable <id>       — désactiver un protocole
+    ///   /gas                — solde ETH + estimation jours restants
+    ///   /json               — télécharger stats.json
+    ///   /stop_bot           — suspendre liquidations
+    ///   /start_bot          — reprendre liquidations
+    ///   /pause_contract     — setPaused(true) on-chain
+    ///   /resume_contract    — setPaused(false) on-chain
+    ///   /logs [N]           — dernières N lignes journalctl
+    ///   /restart            — redémarrer le processus (systemd le relance)
+    ///   /help               — liste des commandes
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_command_listener(
         self,
         started_at: std::time::Instant,
@@ -306,6 +314,8 @@ impl TelegramNotifier {
         dust_excluded: Arc<std::sync::atomic::AtomicU32>,
         eth_balance: Arc<tokio::sync::RwLock<f64>>,
         eth_price: Arc<tokio::sync::RwLock<f64>>,
+        // Protocol registry for /protocols, /enable, /disable
+        protocol_registry: Arc<tokio::sync::RwLock<crate::protocols::ProtocolRegistry>>,
     ) {
         // Separate client with long timeout for Telegram long-polling
         let poll_client = reqwest::Client::builder()
@@ -386,8 +396,19 @@ impl TelegramNotifier {
                     }
 
                     "/stats" | "/bilan" => {
+                        // Optional: "/stats aave_v3" or "/stats radiant_v2"
+                        let proto_arg = text.split_whitespace().nth(1);
                         let stats = crate::stats::StatsStore::load();
-                        let summary = stats.format_summary();
+                        let summary = if let Some(proto_id) = proto_arg {
+                            // Convert machine ID → display name for record lookup
+                            let proto_name = crate::protocols::ALL_PROTOCOLS.iter()
+                                .find(|p| p.id == proto_id)
+                                .map(|p| p.name)
+                                .unwrap_or(proto_id);
+                            stats.format_protocol_summary(proto_name)
+                        } else {
+                            stats.format_summary()
+                        };
                         self.send(&summary).await;
                     }
 
@@ -457,13 +478,42 @@ impl TelegramNotifier {
                     }
 
                     "/hf" => {
-                        let list = hf_list.read().await;
+                        // Optional protocol filter: "/hf aave_v3" or "/hf radiant_v2"
+                        let proto_filter = text.split_whitespace().nth(1);
+
+                        // Clone+filter from the shared list so we release the lock immediately
+                        let list: Vec<(String, f64, f64, String)> = {
+                            let guard = hf_list.read().await;
+                            if let Some(filter) = proto_filter {
+                                // Convert machine ID to display name for matching
+                                let display_name = crate::protocols::ALL_PROTOCOLS.iter()
+                                    .find(|p| p.id == filter)
+                                    .map(|p| p.name);
+                                guard.iter()
+                                    .filter(|(_, _, _, proto)| match display_name {
+                                        Some(n) => proto.as_str() == n,
+                                        // Fallback: substring match in case user typed display name
+                                        None => proto.to_lowercase().contains(&filter.to_lowercase()),
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                guard.clone()
+                            }
+                        };
+
                         let dust  = dust_excluded.load(std::sync::atomic::Ordering::Relaxed);
                         let eth_p = *eth_price.read().await;
                         let min_debt_usd = min_profit_usd * 20.0;
+                        let filter_label = proto_filter
+                            .map(|f| format!(" [{}]", f))
+                            .unwrap_or_default();
 
                         if list.is_empty() && dust == 0 {
-                            self.send(&format!("{} 🟢 Aucune position à risque actuellement.", self.bot_name)).await;
+                            self.send(&format!(
+                                "{} 🟢 Aucune position{filter_label} à risque actuellement.",
+                                self.bot_name
+                            )).await;
                         } else {
                             let red:    Vec<_> = list.iter().filter(|(_, hf, _, _)| *hf < 1.0).collect();
                             let yellow: Vec<_> = list.iter().filter(|(_, hf, _, _)| *hf >= 1.0).collect();
@@ -471,7 +521,7 @@ impl TelegramNotifier {
                             let gas_est_usd = 300_000.0 * max_gas_gwei * 1e-9 * eth_p;
 
                             let mut msg = format!(
-                                "{} 🔍 <b>{} positions à risque</b> (HF &lt; {:.2})\n",
+                                "{} 🔍 <b>{} positions à risque{filter_label}</b> (HF &lt; {:.2})\n",
                                 self.bot_name, list.len(), hf_threshold,
                             );
 
@@ -485,7 +535,7 @@ impl TelegramNotifier {
                                     let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
                                     let close = if *hf < 0.95 { 1.0_f64 } else { 0.5_f64 };
                                     let profit = debt * close * 0.05 - gas_est_usd;
-                                    let proto_short = proto.replace("Aave ", "A").replace(" ", "");
+                                    let proto_short = proto.replace("Aave ", "A").replace(' ', "");
                                     msg.push_str(&format!(
                                         "{:.4}  {:>8.0} $  {:>+8.0} $  {}  {}\n",
                                         hf, debt, profit, short, proto_short,
@@ -501,7 +551,7 @@ impl TelegramNotifier {
                                 msg.push_str("      HF       Dette      Adresse    Proto\n");
                                 for (addr, hf, debt, proto) in yellow.iter().take(20) {
                                     let short = format!("{}…{}", &addr[..6], &addr[addr.len()-4..]);
-                                    let proto_short = proto.replace("Aave ", "A").replace(" ", "");
+                                    let proto_short = proto.replace("Aave ", "A").replace(' ', "");
                                     msg.push_str(&format!(
                                         "{:.4}  {:>10.2} $  {}  {}\n",
                                         hf, debt, short, proto_short,
@@ -513,13 +563,100 @@ impl TelegramNotifier {
                                 msg.push_str("</pre>");
                             }
 
-                            if dust > 0 {
+                            if dust > 0 && proto_filter.is_none() {
                                 msg.push_str(&format!(
                                     "\n⚫ <i>{dust} ignorée(s) — dette &lt; ${min_debt_usd:.0} (non rentable)</i>"
                                 ));
                             }
 
                             self.send(&msg).await;
+                        }
+                    }
+
+                    "/protocols" => {
+                        // Build live stats from available shared state
+                        let users_total = *users_tracked.read().await;
+                        let stats = crate::stats::StatsStore::load();
+
+                        // Per-protocol at-risk count from hf_list
+                        let mut at_risk_by_proto: std::collections::HashMap<&'static str, u32> =
+                            std::collections::HashMap::new();
+                        {
+                            let list = hf_list.read().await;
+                            for (_, _, _, proto) in list.iter() {
+                                if let Some(meta) = crate::protocols::ALL_PROTOCOLS.iter()
+                                    .find(|p| p.name == proto.as_str())
+                                {
+                                    *at_risk_by_proto.entry(meta.id).or_insert(0) += 1;
+                                }
+                            }
+                        }
+
+                        // Build live map: protocol_id → (users, at_risk, net_profit)
+                        let mut live: std::collections::HashMap<&'static str, (usize, u32, f64)> =
+                            std::collections::HashMap::new();
+                        for meta in crate::protocols::ALL_PROTOCOLS {
+                            let (_ok, _fail, net) = stats.protocol_quick_stats(meta.name);
+                            let at_risk = at_risk_by_proto.get(meta.id).copied().unwrap_or(0);
+                            // Phase 1: all users attributed to aave_v3; future protocols get 0
+                            let users = if meta.id == "aave_v3" { users_total } else { 0 };
+                            live.insert(meta.id, (users, at_risk, net));
+                        }
+
+                        let reg = protocol_registry.read().await;
+                        let msg = reg.format_for_telegram(&live);
+                        self.send(&msg).await;
+                    }
+
+                    "/enable" => {
+                        let id = text.split_whitespace().nth(1).unwrap_or("");
+                        if id.is_empty() {
+                            self.send(&format!(
+                                "{} ❌ Usage: <code>/enable &lt;id&gt;</code>\n\
+                                Exemple: <code>/enable radiant_v2</code>\n\
+                                Voir /protocols pour les IDs disponibles.",
+                                self.bot_name
+                            )).await;
+                        } else {
+                            let result = protocol_registry.write().await.enable(id);
+                            match result {
+                                Ok(name) => {
+                                    self.send(&format!(
+                                        "{} ✅ <b>{name}</b> activé.\n\
+                                        Les liquidations reprennent immédiatement.",
+                                        self.bot_name
+                                    )).await;
+                                }
+                                Err(msg) => {
+                                    self.send(&format!("{} ❌ {msg}", self.bot_name)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    "/disable" => {
+                        let id = text.split_whitespace().nth(1).unwrap_or("");
+                        if id.is_empty() {
+                            self.send(&format!(
+                                "{} ❌ Usage: <code>/disable &lt;id&gt;</code>\n\
+                                Exemple: <code>/disable radiant_v2</code>\n\
+                                Voir /protocols pour les IDs disponibles.",
+                                self.bot_name
+                            )).await;
+                        } else {
+                            let result = protocol_registry.write().await.disable(id);
+                            match result {
+                                Ok(name) => {
+                                    self.send(&format!(
+                                        "{} ⏸ <b>{name}</b> désactivé.\n\
+                                        Les liquidations sur ce protocole sont suspendues.",
+                                        self.bot_name
+                                    )).await;
+                                }
+                                Err(msg) => {
+                                    self.send(&format!("{} ❌ {msg}", self.bot_name)).await;
+                                }
+                            }
                         }
                     }
 
@@ -593,10 +730,16 @@ impl TelegramNotifier {
                             "{} 📖 <b>Commandes</b>\n\
                             \n\
                             /status — état du bot (up/down, uptime)\n\
-                            /stats — bilan complet P&amp;L\n\
-                            /hf — positions à risque (HF, dette, adresse)\n\
+                            /stats [id] — bilan P&amp;L (global ou par protocole)\n\
+                            /hf [id] — positions à risque (filtre protocole optionnel)\n\
+                            /protocols — liste des protocoles + statut\n\
                             /gas — solde ETH + estimation ops/jours restants\n\
                             /json — télécharger stats.json\n\
+                            \n\
+                            <b>Protocoles:</b>\n\
+                            /enable &lt;id&gt; — activer un protocole\n\
+                            /disable &lt;id&gt; — désactiver un protocole\n\
+                            Exemples: <code>/stats aave_v3</code>  <code>/hf radiant_v2</code>\n\
                             \n\
                             <b>Contrôle bot:</b>\n\
                             /stop_bot — suspendre les liquidations\n\

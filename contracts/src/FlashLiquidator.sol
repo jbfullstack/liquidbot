@@ -17,8 +17,8 @@ pragma solidity ^0.8.23;
  * ║  6. Sweep profit to cold wallet                              ║
  * ║                                                              ║
  * ║  Security:                                                   ║
- * ║  - coldWallet immutable                                      ║
- * ║  - owner immutable (no transferOwnership)                    ║
+ * ║  - COLD_WALLET immutable                                     ║
+ * ║  - OWNER immutable (no transferOwnership)                    ║
  * ║  - onlyOwner on execute, onlyAavePool on callback            ║
  * ║  - Profit check before repayment                             ║
  * ║  - forceApprove for USDT-like tokens                         ║
@@ -120,21 +120,27 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
     error InvalidAsset();
 
     // ── Immutables ──
-    address public immutable owner;
-    address public immutable coldWallet;
-    IPool public immutable aavePool;
-    IPoolAddressesProvider public immutable aaveProvider;
-    ISwapRouter public immutable uniRouter;
+    address public immutable OWNER;
+    address public immutable COLD_WALLET;
+    IPool public immutable AAVE_POOL;
+    IPoolAddressesProvider public immutable AAVE_PROVIDER;
+    ISwapRouter public immutable UNI_ROUTER;
 
     // ── Storage ──
     bool public paused;
     uint8 private _locked = 1; // 1 = unlocked, 2 = locked (1/2 pattern avoids cold SSTORE cost)
 
     // ── Modifiers ──
-    modifier onlyOwner()    { if (msg.sender != owner) revert NotOwner(); _; }
-    modifier notPaused()    { if (paused) revert Paused(); _; }
-    modifier onlyAavePool() { if (msg.sender != address(aavePool)) revert NotAavePool(); _; }
-    modifier nonReentrant() { if (_locked == 2) revert Reentrancy(); _locked = 2; _; _locked = 1; }
+    modifier onlyOwner()    { _onlyOwner();    _; }
+    modifier notPaused()    { _notPaused();    _; }
+    modifier onlyAavePool() { _onlyAavePool(); _; }
+    modifier nonReentrant() { _nonReentrantBefore(); _; _nonReentrantAfter(); }
+
+    function _onlyOwner()    internal view { if (msg.sender != OWNER)                revert NotOwner();    }
+    function _notPaused()    internal view { if (paused)                              revert Paused();      }
+    function _onlyAavePool() internal view { if (msg.sender != address(AAVE_POOL))   revert NotAavePool(); }
+    function _nonReentrantBefore() internal { if (_locked == 2) revert Reentrancy(); _locked = 2; }
+    function _nonReentrantAfter()  internal { _locked = 1; }
 
     // ── Struct for callback params ──
     struct LiqParams {
@@ -145,6 +151,8 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         uint24  swapFeeTier;       // Uniswap fee tier for collateral→debt swap
         uint256 minSwapOut;        // min output from DEX swap (0 if same-token)
         uint256 minProfit;         // revert if profit < this (in debt token units)
+        address targetPool;        // protocol pool to call liquidationCall on
+                                   // = AAVE_POOL for Aave V3, Radiant pool for Radiant V2, etc.
     }
 
     constructor(
@@ -156,11 +164,11 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         require(_uniRouter  != address(0), "zero router");
         require(_coldWallet != address(0), "zero cold");
 
-        owner      = msg.sender;
-        coldWallet = _coldWallet;
-        aaveProvider = IPoolAddressesProvider(_provider);
-        aavePool     = IPool(aaveProvider.getPool());
-        uniRouter    = ISwapRouter(_uniRouter);
+        OWNER        = msg.sender;
+        COLD_WALLET  = _coldWallet;
+        AAVE_PROVIDER = IPoolAddressesProvider(_provider);
+        AAVE_POOL     = IPool(AAVE_PROVIDER.getPool());
+        UNI_ROUTER    = ISwapRouter(_uniRouter);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -168,10 +176,13 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
     // ═════════════════════════════════════════════════════════════
 
     /**
-     * @notice Liquidate an unhealthy Aave position via flash loan
-     * @dev The bot must verify healthFactor < 1 before calling this.
-     *      If collateral == debt token, no DEX swap is needed.
-     *      If collateral != debt token, we swap via Uniswap.
+     * @notice Liquidate an undercollateralized position via Aave V3 flash loan.
+     * @dev Flash loan source is always Aave V3 (this contract's AAVE_POOL).
+     *      Liquidation target is `targetPool` — can be any protocol with a
+     *      compatible liquidationCall(collateral, debt, user, amount, receiveAToken).
+     *      Pass targetPool = address(AAVE_POOL) for Aave V3 itself.
+     *      Pass targetPool = RADIANT_POOL  for Radiant V2 (0% flash loan fee).
+     *      If collateral == debt token, no DEX swap is needed (swapFeeTier ignored).
      */
     function liquidate(
         address user,
@@ -180,13 +191,15 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         uint256 debtToCover,
         uint24  swapFeeTier,
         uint256 minSwapOut,
-        uint256 minProfit
+        uint256 minProfit,
+        address targetPool         // protocol to liquidate on (address(AAVE_POOL) for Aave V3)
     )
         external
         onlyOwner
         notPaused
         nonReentrant
     {
+        require(targetPool != address(0), "zero targetPool");
         bytes memory params = abi.encode(LiqParams({
             user: user,
             collateralAsset: collateralAsset,
@@ -194,11 +207,12 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
             debtToCover: debtToCover,
             swapFeeTier: swapFeeTier,
             minSwapOut: minSwapOut,
-            minProfit: minProfit
+            minProfit: minProfit,
+            targetPool: targetPool
         }));
 
         // Flash loan the debt token
-        aavePool.flashLoanSimple(
+        AAVE_POOL.flashLoanSimple(
             address(this),
             debtAsset,
             debtToCover,
@@ -240,12 +254,14 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
 
         uint256 totalDebt = amount + premium;
 
-        // Step 1: Approve Aave Pool to take debt token for liquidation
-        _forceApprove(p.debtAsset, address(aavePool), p.debtToCover);
+        // Step 1: Approve the TARGET pool (not necessarily AAVE_POOL) to pull the debt token
+        _forceApprove(p.debtAsset, p.targetPool, p.debtToCover);
 
-        // Step 2: Liquidate — repay debt, receive collateral at discount
+        // Step 2: Liquidate on the target protocol — repay debt, receive collateral at discount
+        // Works for any protocol with liquidationCall(collateral, debt, user, amount, receiveAToken):
+        //   Aave V3, Radiant V2, and any compatible Aave fork.
         // receiveAToken = false → we get the underlying token, not aToken
-        aavePool.liquidationCall(
+        IPool(p.targetPool).liquidationCall(
             p.collateralAsset,
             p.debtAsset,
             p.user,
@@ -283,7 +299,7 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         uint256 profit = debtBalance - totalDebt;
 
         // Step 5: Approve Aave to pull repayment
-        _forceApprove(asset, address(aavePool), totalDebt);
+        _forceApprove(asset, address(AAVE_POOL), totalDebt);
 
         emit LiquidationExecuted(
             p.user, p.debtAsset, p.collateralAsset,
@@ -306,9 +322,9 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
         uint24 feeTier,
         uint256 minOut
     ) internal {
-        _forceApprove(tokenIn, address(uniRouter), amountIn);
+        _forceApprove(tokenIn, address(UNI_ROUTER), amountIn);
 
-        uniRouter.exactInputSingle(ISwapRouter.ExactInputSingleParams({
+        UNI_ROUTER.exactInputSingle(ISwapRouter.ExactInputSingleParams({
             tokenIn:           tokenIn,
             tokenOut:          tokenOut,
             fee:               feeTier,
@@ -331,7 +347,7 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
     function _sweepAll(address token) internal {
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal == 0) return;
-        require(IERC20(token).transfer(coldWallet, bal), "sweep");
+        require(IERC20(token).transfer(COLD_WALLET, bal), "sweep");
         emit ProfitSwept(token, bal);
     }
 
@@ -344,30 +360,30 @@ contract FlashLiquidator is IFlashLoanSimpleReceiver {
     function rescueTokens(address token) external onlyOwner {
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal == 0) revert NothingToRescue();
-        require(IERC20(token).transfer(coldWallet, bal), "rescue");
+        require(IERC20(token).transfer(COLD_WALLET, bal), "rescue");
     }
 
-    function rescueETH() external onlyOwner {
+    function rescueEth() external onlyOwner {
         uint256 bal = address(this).balance;
         if (bal == 0) revert NothingToRescue();
-        (bool ok,) = coldWallet.call{value: bal}("");
+        (bool ok,) = COLD_WALLET.call{value: bal}("");
         require(ok, "eth rescue");
     }
 
     // ── View helpers for the bot ──
 
     function getHealthFactor(address user) external view returns (uint256) {
-        (,,,,, uint256 hf) = aavePool.getUserAccountData(user);
+        (,,,,, uint256 hf) = AAVE_POOL.getUserAccountData(user);
         return hf;
     }
 
     function getFlashPremiumBps() external view returns (uint128) {
-        return aavePool.FLASHLOAN_PREMIUM_TOTAL();
+        return AAVE_POOL.FLASHLOAN_PREMIUM_TOTAL();
     }
 
     // ── Interface ──
-    function ADDRESSES_PROVIDER() external view override returns (IPoolAddressesProvider) { return aaveProvider; }
-    function POOL() external view override returns (IPool) { return aavePool; }
+    function ADDRESSES_PROVIDER() external view override returns (IPoolAddressesProvider) { return AAVE_PROVIDER; }
+    function POOL() external view override returns (IPool) { return AAVE_POOL; }
 
     receive() external payable { revert("no ETH"); }
     fallback() external payable { revert("no fallback"); }

@@ -24,7 +24,7 @@ contract Deploy is Script {
         FlashLiquidator liq = new FlashLiquidator(AAVE_PROVIDER, UNI_ROUTER, cold);
         vm.stopBroadcast();
 
-        require(liq.owner() == deployer, "bad owner");
+        require(liq.OWNER() == deployer, "bad owner");
         console2.log("FlashLiquidator:", address(liq));
     }
 }

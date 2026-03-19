@@ -1,8 +1,9 @@
-//! Liquidator Bot — Phase 1
-//! Monitors Aave V3 on Arbitrum for undercollateralized positions
+//! Liquidator Bot — Phase 2
+//! Monitors Aave V3 and Radiant V2 on Arbitrum for undercollateralized positions
 //! and liquidates them using flash loans.
 
 mod config;
+mod protocols;
 mod stats;
 mod telegram;
 
@@ -66,6 +67,22 @@ sol! {
         event Borrow(address indexed reserve, address onBehalfOf, address indexed user, uint256 amount, uint8 interestRateMode, uint256 borrowRate, uint16 indexed referralCode);
     }
 
+    // Radiant V2 (Aave V2 fork) — same getUserAccountData ABI as IAavePool,
+    // but Borrow event uses uint256 borrowRateMode and swapped user/onBehalfOf.
+    #[sol(rpc)]
+    interface IRadiantPool {
+        function getUserAccountData(address user) external view returns (
+            uint256 totalCollateralBase,
+            uint256 totalDebtBase,
+            uint256 availableBorrowsBase,
+            uint256 currentLiquidationThreshold,
+            uint256 ltv,
+            uint256 healthFactor
+        );
+        // onBehalfOf (indexed) is the debt holder — use this for liquidation targeting
+        event Borrow(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint256 borrowRateMode, uint256 borrowRate, uint16 indexed referralCode);
+    }
+
     #[sol(rpc)]
     interface IFlashLiquidator {
         function liquidate(
@@ -75,15 +92,17 @@ sol! {
             uint256 debtToCover,
             uint24 swapFeeTier,
             uint256 minSwapOut,
-            uint256 minProfit
+            uint256 minProfit,
+            address targetPool
         ) external;
 
         function getHealthFactor(address user) external view returns (uint256);
         function getFlashPremiumBps() external view returns (uint128);
         function paused() external view returns (bool);
-        function owner() external view returns (address);
-        function coldWallet() external view returns (address);
+        function OWNER() external view returns (address);
+        function COLD_WALLET() external view returns (address);
         function setPaused(bool _p) external;
+        function rescueEth() external;
     }
 
     #[sol(rpc)]
@@ -151,6 +170,26 @@ const CHAINLINK_ETH_USD: Address  = address!("639Fe6ab55C921f74e7fac1ee960C0B629
 const UNISWAP_QUOTER_V2: Address  = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
 /// Multicall3 — same address on all EVM chains
 const MULTICALL3: Address         = address!("cA11bde05977b3631167028862bE2a173976CA11");
+
+// ── Radiant V2 on Arbitrum One ──────────────────────────────────────────────
+// Radiant V2 is an Aave V2 fork: same liquidationCall/getUserAccountData ABI.
+// Flash loan source remains Aave V3 (0% fee advantage when liquidating Radiant).
+// ⚠️  MUST verify both addresses on Arbiscan before enabling radiant_v2.
+// RADIANT_POOL: https://arbiscan.io/address/0xF4B1486DD74D07706052A33d31d7c0AAFD0659E1
+// RADIANT_DATA_PROVIDER: https://arbiscan.io/address/0x596B0cc4c5094507C50b579a662FE7072978756f
+const RADIANT_POOL: Address          = address!("F4B1486DD74D07706052A33d31d7c0AAFD0659E1");
+const RADIANT_DATA_PROVIDER: Address = address!("596B0cc4c5094507C50b579a662FE7072978756f");
+
+/// Radiant V2 reserves on Arbitrum One.
+/// Subset of Aave V3 tokens — USDC.e only (no native USDC), no wstETH/LINK/rETH/LUSD.
+const RADIANT_TOKENS: &[(Address, &str, u8)] = &[
+    (address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1"), "WETH",  18),
+    (address!("FF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"), "USDCe",  6),
+    (address!("Fd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"), "USDT",   6),
+    (address!("2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"), "WBTC",   8),
+    (address!("DA10009cBd5D07dd0CeCc66161FC93D7c9000da1"), "DAI",   18),
+    (address!("912CE59144191C1204E64559FE8253a0e49E6548"), "ARB",   18),
+];
 
 /// All active Aave V3 reserve tokens on Arbitrum One: (address, symbol, decimals)
 const TOKENS: &[(Address, &str, u8)] = &[
@@ -456,16 +495,17 @@ struct ReserveData {
 }
 
 /// Fetch getUserAccountData for N users in ONE Multicall3 round-trip.
+/// Each entry is a (user, pool) pair so multi-protocol users route to the correct pool.
 /// Returns one Option per user (None = sub-call failed / user has no position).
 async fn multicall_account_data<P: Provider>(
     provider: &P,
-    users: &[Address],
+    users: &[(Address, Address)],
 ) -> Vec<Option<AccountData>> {
     if users.is_empty() { return Vec::new(); }
 
-    let calls: Vec<IMulticall3::Call3> = users.iter().map(|&user| {
+    let calls: Vec<IMulticall3::Call3> = users.iter().map(|&(user, pool)| {
         IMulticall3::Call3 {
-            target:       AAVE_POOL,
+            target:       pool,
             allowFailure: true,
             callData:     IAavePool::getUserAccountDataCall { user }.abi_encode().into(),
         }
@@ -480,6 +520,7 @@ async fn multicall_account_data<P: Provider>(
     ret.iter().map(|r| {
         if !r.success { return None; }
         // alloy v1: abi_decode_returns takes only &[u8], no validate flag
+        // IAavePool::getUserAccountDataCall works for both Aave V3 and Radiant V2 (same ABI)
         let d = IAavePool::getUserAccountDataCall::abi_decode_returns(&r.returnData).ok()?;
         Some(AccountData {
             health_factor:         d.healthFactor,
@@ -489,15 +530,18 @@ async fn multicall_account_data<P: Provider>(
     }).collect()
 }
 
-/// Fetch getUserReserveData for all TOKENS for one user in ONE Multicall3 round-trip.
-/// Returns one Option per TOKENS entry (in order).
+/// Fetch getUserReserveData for all tokens for one user in ONE Multicall3 round-trip.
+/// `data_provider` and `tokens` are protocol-specific (Aave V3 or Radiant V2).
+/// Returns one Option per tokens entry (in order).
 async fn multicall_reserve_data<P: Provider>(
     provider: &P,
     user: Address,
+    data_provider: Address,
+    tokens: &[(Address, &str, u8)],
 ) -> Vec<Option<ReserveData>> {
-    let calls: Vec<IMulticall3::Call3> = TOKENS.iter().map(|(tok, _, _)| {
+    let calls: Vec<IMulticall3::Call3> = tokens.iter().map(|(tok, _, _)| {
         IMulticall3::Call3 {
-            target:       AAVE_DATA_PROVIDER,
+            target:       data_provider,
             allowFailure: true,
             callData:     IAaveDataProvider::getUserReserveDataCall { asset: *tok, user }.abi_encode().into(),
         }
@@ -505,7 +549,7 @@ async fn multicall_reserve_data<P: Provider>(
 
     let mc = IMulticall3::new(MULTICALL3, provider);
     let Ok(ret) = mc.aggregate3(calls).call().await else {
-        return vec![None; TOKENS.len()];
+        return vec![None; tokens.len()];
     };
 
     ret.iter().map(|r| {
@@ -517,6 +561,33 @@ async fn multicall_reserve_data<P: Provider>(
             usage_as_collateral_enabled: d.usageAsCollateralEnabled,
         })
     }).collect()
+}
+
+// ─── Protocol routing helpers ────────────────────────────────────────────────
+
+/// Returns the on-chain pool address for a given protocol display name.
+/// Used to set targetPool in liquidate() and to route multicall account data.
+fn protocol_pool(protocol: &str) -> Address {
+    match protocol {
+        "Radiant V2" => RADIANT_POOL,
+        _            => AAVE_POOL,
+    }
+}
+
+/// Returns the data provider address for a given protocol display name.
+fn protocol_data_provider(protocol: &str) -> Address {
+    match protocol {
+        "Radiant V2" => RADIANT_DATA_PROVIDER,
+        _            => AAVE_DATA_PROVIDER,
+    }
+}
+
+/// Returns the token list for a given protocol display name.
+fn protocol_tokens(protocol: &str) -> &'static [(Address, &'static str, u8)] {
+    match protocol {
+        "Radiant V2" => RADIANT_TOKENS,
+        _            => TOKENS,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -533,7 +604,7 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
 
     tracing::info!("═══════════════════════════════════════");
-    tracing::info!("   Liquidator Bot v1.0 — Phase 1");
+    tracing::info!("   Liquidator Bot v1.0 — Phase 2 (Aave V3 + Radiant V2)");
     tracing::info!("═══════════════════════════════════════");
 
     // ── Wallet setup ──
@@ -560,11 +631,11 @@ async fn main() -> Result<()> {
     let liquidator    = IFlashLiquidator::new(contract_addr, &http);
     // *_ro: liés à http_ro pour les appels view (eth_call sans vérification de solde)
     let liquidator_ro = IFlashLiquidator::new(contract_addr, &http_ro);
-    let pool          = IAavePool::new(AAVE_POOL, &http_ro);
     // data_prov no longer needed in hot path — replaced by multicall_reserve_data()
+    // Pool instances for startup health checks are created per-user (via protocol_pool)
 
     // ── Verify ──
-    let owner = liquidator_ro.owner().call().await?;
+    let owner = liquidator_ro.OWNER().call().await?;
     if owner != wallet_addr {
         eyre::bail!("Wallet {wallet_addr} is not owner ({owner})");
     }
@@ -631,6 +702,28 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Protocol registry ──
+    // Loads from protocols.json if it exists, otherwise defaults to ["aave_v3"].
+    // Can be toggled at runtime via /enable and /disable Telegram commands.
+    let default_protocols: Vec<String> = std::env::var("ENABLED_PROTOCOLS")
+        .unwrap_or_else(|_| "aave_v3".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let default_refs: Vec<&str> = default_protocols.iter().map(|s| s.as_str()).collect();
+    let protocol_registry = Arc::new(
+        tokio::sync::RwLock::new(protocols::ProtocolRegistry::load(&default_refs))
+    );
+    {
+        let reg = protocol_registry.read().await;
+        let enabled: Vec<_> = protocols::ALL_PROTOCOLS.iter()
+            .filter(|p| reg.is_enabled(p.id))
+            .map(|p| p.name)
+            .collect();
+        tracing::info!("🏛️  Protocoles actifs: {:?}", enabled);
+    }
+
     // ── Persistent stats ──
     let mut stats = StatsStore::load();
     tracing::info!(
@@ -670,6 +763,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Track which addresses came from Radiant V2 (for protocol tagging later)
+    let mut radiant_borrowers: HashSet<Address> = HashSet::new();
+
     let mut chunk_start = scan_from;
     while chunk_start <= current_block {
         let chunk_end = (chunk_start + CHUNK - 1).min(current_block);
@@ -692,7 +788,37 @@ async fn main() -> Result<()> {
         chunk_start = chunk_end + 1;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
-    tracing::info!("Found {} unique borrowers", borrowers.len());
+
+    // ── Radiant V2 Borrow event scan ──
+    if protocol_registry.read().await.is_enabled("radiant_v2") {
+        tracing::info!("📡 Scanning Radiant V2 Borrow events from block {scan_from} to {current_block}...");
+        let mut chunk_start = scan_from;
+        while chunk_start <= current_block {
+            let chunk_end = (chunk_start + CHUNK - 1).min(current_block);
+            let log_filter = Filter::new()
+                .address(RADIANT_POOL)
+                .event_signature(IRadiantPool::Borrow::SIGNATURE_HASH)
+                .from_block(chunk_start)
+                .to_block(chunk_end);
+
+            match http_ro.get_logs(&log_filter).await {
+                Ok(logs) => {
+                    for log in &logs {
+                        if let Ok(ev) = IRadiantPool::Borrow::decode_log_data(log.data()) {
+                            borrowers.insert(ev.onBehalfOf);
+                            radiant_borrowers.insert(ev.onBehalfOf);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("Radiant get_logs {chunk_start}-{chunk_end} failed: {e}"),
+            }
+            chunk_start = chunk_end + 1;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        tracing::info!("Found {} Radiant V2 borrowers", radiant_borrowers.len());
+    }
+
+    tracing::info!("Found {} unique borrowers (all protocols)", borrowers.len());
 
     // Batch health factor checks
     let hf_thresh = U256::from((cfg.health_factor_threshold * 1e18) as u128);
@@ -702,7 +828,11 @@ async fn main() -> Result<()> {
 
     for chunk in borrowers.iter().collect::<Vec<_>>().chunks(20) {
         for &&user in chunk {
-            if let Ok(d) = pool.getUserAccountData(user).call().await {
+            // Determine which protocol this user belongs to for correct pool routing
+            let user_protocol = if radiant_borrowers.contains(&user) { "Radiant V2" } else { "Aave V3" };
+            let user_pool = protocol_pool(user_protocol);
+            let pool_instance = IAavePool::new(user_pool, &http_ro);
+            if let Ok(d) = pool_instance.getUserAccountData(user).call().await {
                 if d.totalDebtBase > U256::ZERO {
                     if d.healthFactor < hf_thresh { at_risk += 1; }
                     let interval = refresh_interval_blocks(d.healthFactor);
@@ -712,7 +842,7 @@ async fn main() -> Result<()> {
                         total_debt_base: d.totalDebtBase,
                         last_block: current_block,
                         next_refresh_at: current_block + interval,
-                        protocol: "Aave V3".to_string(),
+                        protocol: user_protocol.to_string(),
                     });
                 }
             }
@@ -752,7 +882,7 @@ async fn main() -> Result<()> {
 
     // ── Spawn Telegram command listener (separate task, never blocks bot) ──
     if let Some(ref tg) = tg {
-        let tg_cmd    = tg.clone();
+        let tg_cmd        = tg.clone();
         let tracked_ref   = shared_tracked.clone();
         let risk_ref      = shared_at_risk.clone();
         let active_ref    = bot_active.clone();
@@ -760,6 +890,7 @@ async fn main() -> Result<()> {
         let dust_ref      = shared_dust_excluded.clone();
         let eth_bal_ref   = shared_eth_bal.clone();
         let eth_price_ref = shared_eth_price.clone();
+        let registry_ref  = protocol_registry.clone();
         let hot = format!("{wallet_addr}");
         tokio::spawn(async move {
             tg_cmd.run_command_listener(
@@ -777,9 +908,10 @@ async fn main() -> Result<()> {
                 dust_ref,
                 eth_bal_ref,
                 eth_price_ref,
+                registry_ref,
             ).await;
         });
-        tracing::info!("📱 Telegram commands: /status /stats /json /hf /gas /help /stop_bot /start_bot /pause_contract /resume_contract");
+        tracing::info!("📱 Telegram commands: /status /stats [id] /hf [id] /protocols /enable /disable /gas /json /help /stop_bot /start_bot /pause_contract /resume_contract");
     }
 
     // ── Fee tier cache + pre-warm ──────────────────────────────────────────────
@@ -857,6 +989,11 @@ async fn main() -> Result<()> {
         .address(AAVE_POOL)
         .event_signature(IAavePool::Borrow::SIGNATURE_HASH);
 
+    // Radiant V2 borrow filter (Aave V2 Borrow event — different signature from V3)
+    let radiant_borrow_filter = alloy::rpc::types::Filter::new()
+        .address(RADIANT_POOL)
+        .event_signature(IRadiantPool::Borrow::SIGNATURE_HASH);
+
     let mut stats_liq = 0u32;
     let mut stats_profit = 0.0f64;
     let mut prev_eth_price = eth_price_usd;
@@ -914,6 +1051,7 @@ async fn main() -> Result<()> {
         };
 
         // ── Subscribe ──
+        let radiant_enabled = protocol_registry.read().await.is_enabled("radiant_v2");
         let (Ok(borrow_sub), Ok(block_sub), Ok(price_sub)) = (
             ws.subscribe_logs(&borrow_filter).await,
             ws.subscribe_blocks().await,
@@ -923,8 +1061,21 @@ async fn main() -> Result<()> {
             reconnect_delay = std::time::Duration::from_secs(5);
             continue 'reconnect;
         };
+        let radiant_sub = if radiant_enabled {
+            ws.subscribe_logs(&radiant_borrow_filter).await.ok()
+        } else {
+            None
+        };
 
-        let mut borrow_stream = borrow_sub.into_stream();
+        // Merge Aave V3 and Radiant V2 borrow log streams into a single SelectAll stream.
+        // Dispatch is done by checking log.address() inside the handler.
+        use futures_util::stream::SelectAll;
+        let mut borrow_stream: SelectAll<Box<dyn futures_util::Stream<Item = alloy::rpc::types::Log> + Send + Unpin>> = SelectAll::new();
+        borrow_stream.push(Box::new(borrow_sub.into_stream()));
+        if let Some(rsub) = radiant_sub {
+            borrow_stream.push(Box::new(rsub.into_stream()));
+        }
+
         let mut stream        = block_sub.into_stream();
         let mut price_stream  = price_sub.into_stream();
 
@@ -934,22 +1085,42 @@ async fn main() -> Result<()> {
         loop {
         tokio::select! {
             // ── New Borrow event: add borrower to index ──
+            // Merged stream covers both Aave V3 and Radiant V2; dispatch by log.address().
             borrow_opt = borrow_stream.next() => {
                 let Some(log) = borrow_opt else {
                     tracing::warn!("Borrow stream ended"); break;
                 };
-                if let Ok(ev) = IAavePool::Borrow::decode_log_data(log.data()) {
-                    let mut idx = user_index.write().await;
-                    if let Some(pos) = idx.get_mut(&ev.user) {
-                        // Existing user borrowed more: their debt changed, force an immediate
-                        // refresh so the index reflects the new total_debt_base this block.
-                        // Without this, a dust position that grows profitable could stay
-                        // invisible until the slow priority refresh interval expires.
-                        pos.next_refresh_at = 0;
-                        tracing::debug!("🔄 Existing borrower re-scheduled for refresh: {}", ev.user);
-                    } else {
-                        index_borrower(&mut idx, ev.user);
-                        tracing::debug!("📥 New borrower indexed: {}", ev.user);
+                let source = log.address();
+                if source == RADIANT_POOL {
+                    // ── Radiant V2 Borrow event ──
+                    if let Ok(ev) = IRadiantPool::Borrow::decode_log_data(log.data()) {
+                        let mut idx = user_index.write().await;
+                        if let Some(pos) = idx.get_mut(&ev.onBehalfOf) {
+                            pos.next_refresh_at = 0;
+                            tracing::debug!("🔄 Radiant borrower re-scheduled: {}", ev.onBehalfOf);
+                        } else {
+                            index_borrower(&mut idx, ev.onBehalfOf);
+                            if let Some(pos) = idx.get_mut(&ev.onBehalfOf) {
+                                pos.protocol = "Radiant V2".to_string();
+                            }
+                            tracing::debug!("📥 New Radiant borrower indexed: {}", ev.onBehalfOf);
+                        }
+                    }
+                } else {
+                    // ── Aave V3 Borrow event ──
+                    if let Ok(ev) = IAavePool::Borrow::decode_log_data(log.data()) {
+                        let mut idx = user_index.write().await;
+                        if let Some(pos) = idx.get_mut(&ev.user) {
+                            // Existing user borrowed more: their debt changed, force an immediate
+                            // refresh so the index reflects the new total_debt_base this block.
+                            // Without this, a dust position that grows profitable could stay
+                            // invisible until the slow priority refresh interval expires.
+                            pos.next_refresh_at = 0;
+                            tracing::debug!("🔄 Existing borrower re-scheduled for refresh: {}", ev.user);
+                        } else {
+                            index_borrower(&mut idx, ev.user);
+                            tracing::debug!("📥 New borrower indexed: {}", ev.user);
+                        }
                     }
                 }
             }
@@ -1110,10 +1281,14 @@ async fn main() -> Result<()> {
                     due.truncate(MAX_REFRESH_PER_BLOCK);
 
                     if !due.is_empty() {
-                        let users: Vec<Address> = due.iter().map(|(u, _)| *u).collect();
+                        // Build (user, pool) pairs — each user routes to its protocol's pool
+                        let users_with_pools: Vec<(Address, Address)> = {
+                            let idx = user_index.read().await;
+                            due.iter().map(|(u, _)| (*u, protocol_pool(idx.get(u).map_or("Aave V3", |p| &p.protocol)))).collect()
+                        };
 
                         // One Multicall3 round-trip for all N users (was N parallel calls)
-                        let results = multicall_account_data(&http_ro, &users).await;
+                        let results = multicall_account_data(&http_ro, &users_with_pools).await;
 
                         // Single write-lock to apply all updates atomically
                         let mut idx = user_index.write().await;
@@ -1317,9 +1492,23 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Skip all liquidations if no protocols are enabled at all
+                // (per-user routing later ensures we only liquidate on enabled protocols)
+                {
+                    let reg = protocol_registry.read().await;
+                    let any_enabled = protocols::ALL_PROTOCOLS.iter()
+                        .any(|p| p.impl_status == protocols::ImplStatus::Active && reg.is_enabled(p.id));
+                    if !any_enabled { continue; }
+                }
+
                 // Fetch health data for ALL at-risk users in ONE Multicall3 call.
                 // During flash crashes this can be 10+ users; one call instead of 10 sequential.
-                let account_data_batch = multicall_account_data(&http_ro, &at_risk_users).await;
+                // Each user routes to its protocol's pool for correct getUserAccountData target.
+                let at_risk_with_pools: Vec<(Address, Address)> = {
+                    let idx = user_index.read().await;
+                    at_risk_users.iter().map(|u| (*u, protocol_pool(idx.get(u).map_or("Aave V3", |p| &p.protocol)))).collect()
+                };
+                let account_data_batch = multicall_account_data(&http_ro, &at_risk_with_pools).await;
 
                 for (user, d_opt) in at_risk_users.iter().zip(account_data_batch.iter()) {
                     // Skip if we already have a pending tx for this user
@@ -1363,14 +1552,36 @@ async fn main() -> Result<()> {
                         close_factor * 100.0,
                     );
 
+                    // Look up user's protocol for routing to correct pool and data provider
+                    let user_protocol = user_index.read().await
+                        .get(user)
+                        .map(|p| p.protocol.clone())
+                        .unwrap_or_else(|| "Aave V3".to_string());
+
+                    // Skip if this user's protocol is currently disabled
+                    {
+                        let protocol_id = match user_protocol.as_str() {
+                            "Radiant V2" => "radiant_v2",
+                            _            => "aave_v3",
+                        };
+                        if !protocol_registry.read().await.is_enabled(protocol_id) {
+                            tracing::debug!("  Skip {user}: protocol {} disabled", user_protocol);
+                            continue;
+                        }
+                    }
+
+                    let target_pool   = protocol_pool(&user_protocol);
+                    let data_prov     = protocol_data_provider(&user_protocol);
+                    let user_tokens   = protocol_tokens(&user_protocol);
+
                     // Find best debt + collateral across all tracked tokens
                     let mut best_debt: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
                     let mut best_coll: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
 
                     {
-                        // One Multicall3 call for all 11 TOKENS (was 11 parallel calls)
-                        let results = multicall_reserve_data(&http_ro, *user).await;
-                        for ((tok, name, decimals), rd_opt) in TOKENS.iter().zip(results.iter()) {
+                        // One Multicall3 call for all tokens (was N parallel calls)
+                        let results = multicall_reserve_data(&http_ro, *user, data_prov, user_tokens).await;
+                        for ((tok, name, decimals), rd_opt) in user_tokens.iter().zip(results.iter()) {
                             let Some(rd) = rd_opt else { continue; };
                             if rd.current_variable_debt > best_debt.1 {
                                 best_debt = (*tok, rd.current_variable_debt, name, *decimals);
@@ -1449,6 +1660,7 @@ async fn main() -> Result<()> {
                         fee_tier,
                         min_swap_out,
                         min_profit,
+                        target_pool,  // protocol-specific pool (was hardcoded AAVE_POOL)
                     );
 
                     // Simulate via estimateGas
@@ -1539,7 +1751,7 @@ async fn main() -> Result<()> {
                                     // Record GROSS profit — stats.rs subtracts gas separately
                                     stats.record_liquidation(
                                         &format!("{user}"),
-                                        "Aave V3",
+                                        &user_protocol,
                                         best_debt.2,
                                         best_coll.2,
                                         debt_usd,
@@ -1599,7 +1811,7 @@ async fn main() -> Result<()> {
 
                                     stats.record_liquidation(
                                         &format!("{user}"),
-                                        "Aave V3",
+                                        &user_protocol,
                                         best_debt.2,
                                         best_coll.2,
                                         debt_usd,
@@ -2529,5 +2741,32 @@ mod tests {
             "parallel reserve fetch took {}ms — expected <30ms (was ~55ms sequential)",
             elapsed.as_millis()
         );
+    }
+
+    // ── Protocol routing helpers ──────────────────────────────
+
+    #[test]
+    fn test_protocol_pool_routing() {
+        assert_eq!(protocol_pool("Aave V3"),    AAVE_POOL,     "Aave V3 must route to AAVE_POOL");
+        assert_eq!(protocol_pool("Radiant V2"), RADIANT_POOL,  "Radiant V2 must route to RADIANT_POOL");
+        assert_eq!(protocol_pool("unknown"),    AAVE_POOL,     "unknown must fallback to AAVE_POOL");
+        assert_ne!(RADIANT_POOL, AAVE_POOL,    "pools must be distinct addresses");
+    }
+
+    #[test]
+    fn test_radiant_tokens_not_empty() {
+        assert!(!RADIANT_TOKENS.is_empty(), "Radiant V2 must have at least one token");
+        // All tokens must have non-zero address and valid decimals
+        for (addr, sym, dec) in RADIANT_TOKENS {
+            assert_ne!(*addr, Address::ZERO, "token {sym} has zero address");
+            assert!(*dec == 6 || *dec == 8 || *dec == 18, "token {sym} has unexpected decimals {dec}");
+        }
+    }
+
+    #[test]
+    fn test_protocol_data_provider_routing() {
+        assert_eq!(protocol_data_provider("Aave V3"),    AAVE_DATA_PROVIDER);
+        assert_eq!(protocol_data_provider("Radiant V2"), RADIANT_DATA_PROVIDER);
+        assert_ne!(RADIANT_DATA_PROVIDER, AAVE_DATA_PROVIDER);
     }
 }

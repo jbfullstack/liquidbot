@@ -184,6 +184,96 @@ impl StatsStore {
         result
     }
 
+    /// Quick stats for a specific protocol: (successes, failures, net_profit_usd).
+    ///
+    /// `protocol_name` is the display name as stored in LiqRecord.protocol (e.g. "Aave V3").
+    /// Comparison is case-insensitive.
+    pub fn protocol_quick_stats(&self, protocol_name: &str) -> (usize, usize, f64) {
+        let name_lo = protocol_name.to_lowercase();
+        let mut successes = 0usize;
+        let mut failures  = 0usize;
+        let mut gross     = 0.0f64;
+        let mut gas       = 0.0f64;
+        for r in self.records.iter().filter(|r| r.protocol.to_lowercase() == name_lo) {
+            if r.success { successes += 1; gross += r.profit_usd; }
+            else          { failures  += 1; }
+            gas += r.gas_usd;
+        }
+        (successes, failures, gross - gas)
+    }
+
+    /// Full P&L summary filtered to one protocol (like `format_summary` but scoped).
+    ///
+    /// `protocol_name` is the display name as stored in records (e.g. "Aave V3").
+    pub fn format_protocol_summary(&self, protocol_name: &str) -> String {
+        let name_lo = protocol_name.to_lowercase();
+        let recs: Vec<&LiqRecord> = self.records.iter()
+            .filter(|r| r.protocol.to_lowercase() == name_lo)
+            .collect();
+
+        if recs.is_empty() {
+            return format!(
+                "📊 <b>Bilan {protocol_name}</b>\n\nAucune liquidation enregistrée pour ce protocole."
+            );
+        }
+
+        let gross: f64 = recs.iter().filter(|r| r.success).map(|r| r.profit_usd).sum();
+        let gas:   f64 = recs.iter().map(|r| r.gas_usd).sum();
+        let net = gross - gas;
+        let successes = recs.iter().filter(|r| r.success).count();
+        let failures  = recs.iter().filter(|r| !r.success).count();
+
+        let mut lines = Vec::new();
+        lines.push(format!("📊 <b>Bilan {protocol_name}</b>"));
+        lines.push(format!(
+            "💰 Profit net: <b>${:.2}</b> (brut ${:.2} - gas ${:.2})",
+            net, gross, gas,
+        ));
+        lines.push(format!("✅ {} réussies | ❌ {} échouées", successes, failures));
+
+        // Monthly breakdown (successes only)
+        let mut monthly: BTreeMap<i32, BTreeMap<u32, f64>> = BTreeMap::new();
+        for r in recs.iter().filter(|r| r.success) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&r.timestamp) {
+                *monthly.entry(dt.year()).or_default()
+                        .entry(dt.month()).or_default() += r.profit_usd;
+            }
+        }
+        let month_names = [
+            "", "Jan", "Fév", "Mar", "Avr", "Mai", "Jun",
+            "Jul", "Aoû", "Sep", "Oct", "Nov", "Déc",
+        ];
+        for (&year, months) in &monthly {
+            let year_total: f64 = months.values().sum();
+            lines.push(String::new());
+            lines.push(format!("📅 <b>{year}</b>: ${year_total:.2}"));
+            for (&m, &v) in months {
+                let bar_len = (v / year_total.max(0.01) * 20.0).max(1.0) as usize;
+                let bar: String = "█".repeat(bar_len.min(20));
+                lines.push(format!("　{} {} ${:.2}", month_names[m as usize], bar, v));
+            }
+        }
+
+        // Token breakdown (top 5 by net profit)
+        let mut token_bd: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+        for r in &recs {
+            let e = token_bd.entry(r.debt_token.clone()).or_insert((0, 0, 0.0));
+            if r.success { e.0 += 1; e.2 += r.profit_usd; } else { e.1 += 1; }
+            e.2 -= r.gas_usd;
+        }
+        if !token_bd.is_empty() {
+            lines.push(String::new());
+            lines.push("🪙 <b>Par token (dette)</b>".to_string());
+            let mut tv: Vec<_> = token_bd.iter().collect();
+            tv.sort_by(|a, b| b.1.2.partial_cmp(&a.1.2).unwrap_or(std::cmp::Ordering::Equal));
+            for (token, (ok, fail, net)) in tv.iter().take(5) {
+                lines.push(format!("　{token}: ✅{ok} ❌{fail}  ${net:.2}"));
+            }
+        }
+
+        lines.join("\n")
+    }
+
     /// Format a complete stats summary for Telegram
     pub fn format_summary(&self) -> String {
         let gross = self.total_profit();
@@ -442,6 +532,82 @@ mod tests {
 
         let loaded = StatsStore::load_from(&path);
         assert_eq!(loaded.records.len(), 2);
+    }
+
+    // ── protocol_quick_stats ──
+
+    #[test]
+    fn test_protocol_quick_stats_correct() {
+        let mut s = store_with(vec![
+            make_record(true,  100.0, 1.0),  // Aave V3
+            make_record(false,   0.0, 0.5),  // Aave V3 failure
+            make_record(true,   50.0, 0.8),  // Aave V3
+        ]);
+        // Add a Radiant V2 record
+        let mut r = make_record(true, 30.0, 0.3);
+        r.protocol = "Radiant V2".to_string();
+        s.records.push(r);
+
+        let (ok, fail, net) = s.protocol_quick_stats("Aave V3");
+        assert_eq!(ok, 2);
+        assert_eq!(fail, 1);
+        // net = (100+50) - (1.0+0.5+0.8) = 150 - 2.3 = 147.70
+        assert!((net - 147.7).abs() < 1e-9, "net={net}");
+
+        let (ok2, fail2, net2) = s.protocol_quick_stats("Radiant V2");
+        assert_eq!(ok2, 1);
+        assert_eq!(fail2, 0);
+        // net = 30 - 0.3 = 29.7
+        assert!((net2 - 29.7).abs() < 1e-9, "net2={net2}");
+    }
+
+    #[test]
+    fn test_protocol_quick_stats_case_insensitive() {
+        let s = store_with(vec![make_record(true, 10.0, 1.0)]);
+        let (ok, _, _) = s.protocol_quick_stats("aave v3");
+        assert_eq!(ok, 1, "Lookup must be case-insensitive");
+    }
+
+    #[test]
+    fn test_protocol_quick_stats_unknown_returns_zeros() {
+        let s = store_with(vec![make_record(true, 10.0, 1.0)]);
+        let (ok, fail, net) = s.protocol_quick_stats("Compound V3");
+        assert_eq!(ok, 0);
+        assert_eq!(fail, 0);
+        assert_eq!(net, 0.0);
+    }
+
+    // ── format_protocol_summary ──
+
+    #[test]
+    fn test_format_protocol_summary_empty() {
+        let s = store_with(vec![]);
+        let out = s.format_protocol_summary("Aave V3");
+        assert!(out.contains("Aave V3"));
+        assert!(out.contains("Aucune liquidation"), "out={out}");
+    }
+
+    #[test]
+    fn test_format_protocol_summary_contains_net_profit() {
+        let s = store_with(vec![
+            make_record(true, 100.0, 2.0),
+            make_record(false, 0.0, 0.5),
+        ]);
+        let out = s.format_protocol_summary("Aave V3");
+        // net = 100 - 2.5 = 97.50
+        assert!(out.contains("97.50"), "out={out}");
+    }
+
+    #[test]
+    fn test_format_protocol_summary_does_not_include_other_protocols() {
+        let mut s = store_with(vec![make_record(true, 100.0, 1.0)]);
+        let mut radiant = make_record(true, 999.0, 1.0);
+        radiant.protocol = "Radiant V2".to_string();
+        s.records.push(radiant);
+
+        let out = s.format_protocol_summary("Aave V3");
+        // The Radiant V2 profit of $999 must not appear
+        assert!(!out.contains("999"), "Other protocol profit must not leak: {out}");
     }
 
     // ── format_summary smoke test ──
