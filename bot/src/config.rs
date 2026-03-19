@@ -12,6 +12,7 @@ pub struct Config {
     pub eth_keep: f64,       // minimum ETH to keep for gas (skip tx if below)
     pub eth_sweep_keep: f64, // ETH to keep after sweep (must be >= eth_keep)
     pub health_factor_threshold: f64,  // e.g. 1.05 — start watching
+    pub scan_lookback_blocks: u64,     // blocks to scan at first start (no saved index)
     pub telegram_token: String,
     pub telegram_chat_id: String,
 }
@@ -44,6 +45,9 @@ impl Config {
             health_factor_threshold: std::env::var("HF_THRESHOLD")
                 .unwrap_or("1.05".into()).parse()
                 .map_err(|_| eyre!("HF_THRESHOLD must be a number"))?,
+            scan_lookback_blocks: std::env::var("SCAN_LOOKBACK_BLOCKS")
+                .unwrap_or("4000000".into()).parse()
+                .map_err(|_| eyre!("SCAN_LOOKBACK_BLOCKS must be an integer"))?,
             telegram_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .unwrap_or_default(),
             telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID")
@@ -77,6 +81,21 @@ impl Config {
                 self.health_factor_threshold
             ));
         }
+        // Arbitrum ~0.25s/block → 1 week ≈ 2_500_000 blocks
+        if self.scan_lookback_blocks < 2_500_000 {
+            return Err(eyre!(
+                "SCAN_LOOKBACK_BLOCKS must be >= 2_500_000 (~1 week), got {}. \
+                 A shorter window risks missing active borrowers.",
+                self.scan_lookback_blocks
+            ));
+        }
+        if self.scan_lookback_blocks > 20_000_000 {
+            return Err(eyre!(
+                "SCAN_LOOKBACK_BLOCKS must be <= 20_000_000 (~58 days), got {}. \
+                 A larger value makes cold-start very slow.",
+                self.scan_lookback_blocks
+            ));
+        }
         Ok(())
     }
 }
@@ -97,7 +116,7 @@ mod tests {
 
     fn clear_optional() {
         for key in &["MIN_PROFIT_USD", "MAX_GAS_GWEI", "ETH_KEEP", "ETH_SWEEP_KEEP",
-                     "HF_THRESHOLD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] {
+                     "HF_THRESHOLD", "SCAN_LOOKBACK_BLOCKS", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] {
             std::env::remove_var(key);
         }
     }
@@ -113,6 +132,7 @@ mod tests {
         assert_eq!(cfg.eth_keep, 0.005);
         assert_eq!(cfg.eth_sweep_keep, 0.03);
         assert_eq!(cfg.health_factor_threshold, 1.05);
+        assert_eq!(cfg.scan_lookback_blocks, 4_000_000);
         assert!(cfg.telegram_token.is_empty());
     }
 
@@ -196,6 +216,28 @@ mod tests {
         set_required();
         std::env::set_var("MIN_PROFIT_USD", "abc");
         assert!(Config::from_env().is_err());
+        clear_optional();
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_lookback_too_small() {
+        set_required();
+        clear_optional();
+        std::env::set_var("SCAN_LOOKBACK_BLOCKS", "100000");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("SCAN_LOOKBACK_BLOCKS"));
+        clear_optional();
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_lookback_too_large() {
+        set_required();
+        clear_optional();
+        std::env::set_var("SCAN_LOOKBACK_BLOCKS", "25000000");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("SCAN_LOOKBACK_BLOCKS"));
         clear_optional();
     }
 }

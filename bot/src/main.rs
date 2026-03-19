@@ -2,6 +2,7 @@
 //! Monitors Aave V3 and Radiant V2 on Arbitrum for undercollateralized positions
 //! and liquidates them using flash loans.
 
+mod competitors;
 mod config;
 mod protocols;
 mod stats;
@@ -65,6 +66,18 @@ sol! {
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
 
         event Borrow(address indexed reserve, address onBehalfOf, address indexed user, uint256 amount, uint8 interestRateMode, uint256 borrowRate, uint16 indexed referralCode);
+
+        // Fired whenever a position is liquidated — by us OR by a competitor.
+        // Same signature on Aave V2/V3 and all forks (Radiant V2 included).
+        event LiquidationCall(
+            address indexed collateralAsset,
+            address indexed debtAsset,
+            address indexed user,
+            uint256 debtToCover,
+            uint256 liquidatedCollateralAmount,
+            address liquidator,
+            bool receiveAToken
+        );
     }
 
     // Radiant V2 (Aave V2 fork) — same getUserAccountData ABI as IAavePool,
@@ -225,6 +238,30 @@ struct UserPosition {
 
 type UserIndex = Arc<RwLock<HashMap<Address, UserPosition>>>;
 
+/// One missed liquidation event (competitor was faster, or position was never indexed).
+#[derive(Debug, Clone)]
+pub struct MissedEvent {
+    pub user:       String,
+    pub liquidator: String,
+    pub debt_sym:   String,
+    pub debt_amt:   f64,
+    pub col_sym:    String,
+    pub protocol:   String,
+    pub tx_hash:    String,
+    /// HF we last recorded for this user (0.0 if we never tracked them)
+    pub last_hf:    f64,
+    /// Our estimated profit we missed (debt_amt * ~5% bonus, rough)
+    pub est_profit: f64,
+    /// true = position wasn't in our index (indexing blind spot, not a race loss)
+    pub untracked:    bool,
+    /// Block where the liquidation was executed (0 if unavailable)
+    pub block_number: u64,
+    /// Full 0x address of debt token (for offline analysis)
+    pub debt_asset:   String,
+    /// Full 0x address of collateral token (for offline analysis)
+    pub col_asset:    String,
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════
@@ -312,8 +349,6 @@ fn remove_if_repaid(idx: &mut HashMap<Address, UserPosition>, user: &Address, to
 // ═══════════════════════════════════════════════════════════════
 
 const INDEX_FILE: &str = "user_index.json";
-/// Default lookback when no saved index exists: ~14 days on Arbitrum (~0.25s/block)
-const DEFAULT_LOOKBACK: u64 = 4_000_000;
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SavedIndex {
@@ -738,12 +773,17 @@ async fn main() -> Result<()> {
     // Load persisted index from previous run (survives restarts)
     let saved = load_saved_index();
     let saved_count = saved.addresses.len();
+    let lookback_start = current_block.saturating_sub(cfg.scan_lookback_blocks);
     let scan_from = if saved.last_saved_block > 0 {
-        // Resume from where we left off — only scan new blocks
-        saved.last_saved_block + 1
+        // Resume from last saved block.
+        // .max(lookback_start): if the saved index is older than the lookback window,
+        // skip the already-indexed ancient blocks and start from lookback_start instead.
+        // If the saved index is recent (last_saved_block > lookback_start),
+        // just scan the new blocks since last save — never re-scan needlessly.
+        (saved.last_saved_block + 1).max(lookback_start)
     } else {
-        // First ever run — scan last ~14 days of Borrow events
-        current_block.saturating_sub(DEFAULT_LOOKBACK)
+        // First ever run — scan configured lookback window (SCAN_LOOKBACK_BLOCKS)
+        lookback_start
     };
 
     tracing::info!(
@@ -873,6 +913,12 @@ async fn main() -> Result<()> {
     let shared_hf_list: Arc<RwLock<Vec<(String, f64, f64, String)>>> = Arc::new(RwLock::new(Vec::new()));
     // Count of HF<threshold positions excluded from tracking because debt is too small to be profitable
     let shared_dust_excluded: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    // Count of liquidations done by competitors on positions we were tracking
+    let shared_missed: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+    // Competitor registry — persists labels (pb_01…) across restarts
+    let competitor_registry = Arc::new(RwLock::new(competitors::CompetitorStore::load()));
+    tracing::info!("⚔️  {} concurrent(s) connus", competitor_registry.read().await.competitors.len());
 
     // ── Bot active flag (toggled by /start_bot and /stop_bot) ──
     let bot_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
@@ -891,6 +937,8 @@ async fn main() -> Result<()> {
         let eth_bal_ref   = shared_eth_bal.clone();
         let eth_price_ref = shared_eth_price.clone();
         let registry_ref  = protocol_registry.clone();
+        let missed_ref      = shared_missed.clone();
+        let competitor_ref  = competitor_registry.clone();
         let hot = format!("{wallet_addr}");
         tokio::spawn(async move {
             tg_cmd.run_command_listener(
@@ -909,6 +957,8 @@ async fn main() -> Result<()> {
                 eth_bal_ref,
                 eth_price_ref,
                 registry_ref,
+                missed_ref,
+                competitor_ref,
             ).await;
         });
         tracing::info!("📱 Telegram commands: /status /stats [id] /hf [id] /protocols /enable /disable /gas /json /help /stop_bot /start_bot /pause_contract /resume_contract");
@@ -978,6 +1028,10 @@ async fn main() -> Result<()> {
     // ── pending_liquidations: prevents double-sending on the same user ──
     let mut pending_liquidations: HashSet<Address> = HashSet::new();
 
+    // ── Missed-liquidation buffer: groups events within a 8s window ──
+    let mut missed_buffer: Vec<MissedEvent> = Vec::new();
+    let mut flush_deadline: Option<tokio::time::Instant> = None;
+
 
     // ── Priority refresh: users are refreshed based on their HF proximity to 1.0 ──
     // refresh_interval_blocks() returns fewer blocks for riskier positions.
@@ -993,6 +1047,12 @@ async fn main() -> Result<()> {
     let radiant_borrow_filter = alloy::rpc::types::Filter::new()
         .address(RADIANT_POOL)
         .event_signature(IRadiantPool::Borrow::SIGNATURE_HASH);
+
+    // LiquidationCall filter — covers both Aave V3 and Radiant V2 (same event signature).
+    // Fires for ALL liquidations, including by competitors — used for missed-opportunity tracking.
+    let liq_filter = alloy::rpc::types::Filter::new()
+        .address(vec![AAVE_POOL, RADIANT_POOL])
+        .event_signature(IAavePool::LiquidationCall::SIGNATURE_HASH);
 
     let mut stats_liq = 0u32;
     let mut stats_profit = 0.0f64;
@@ -1066,6 +1126,14 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        let liq_sub = match ws.subscribe_logs(&liq_filter).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("LiquidationCall subscribe failed: {e}");
+                reconnect_delay = std::time::Duration::from_secs(5);
+                continue 'reconnect;
+            }
+        };
 
         // Merge Aave V3 and Radiant V2 borrow log streams into a single SelectAll stream.
         // Dispatch is done by checking log.address() inside the handler.
@@ -1078,8 +1146,9 @@ async fn main() -> Result<()> {
 
         let mut stream        = block_sub.into_stream();
         let mut price_stream  = price_sub.into_stream();
+        let mut liq_stream    = liq_sub.into_stream();
 
-        tracing::info!("🔄 Listening for new blocks + new borrowers + oracle updates...");
+        tracing::info!("🔄 Listening for new blocks + new borrowers + oracle updates + liquidations...");
 
         // ── Inner event loop ──
         loop {
@@ -1121,6 +1190,167 @@ async fn main() -> Result<()> {
                             index_borrower(&mut idx, ev.user);
                             tracing::debug!("📥 New borrower indexed: {}", ev.user);
                         }
+                    }
+                }
+            }
+
+            // ── LiquidationCall: someone (us or competitor) liquidated a position ──
+            liq_opt = liq_stream.next() => {
+                let Some(log) = liq_opt else {
+                    tracing::warn!("Liquidation stream ended"); break;
+                };
+                if let Ok(ev) = IAavePool::LiquidationCall::decode_log_data(log.data()) {
+                    let protocol = if log.address() == RADIANT_POOL { "RDT" } else { "AV3" };
+                    let is_ours  = ev.liquidator == wallet_addr;
+                    let tracked  = user_index.read().await.contains_key(&ev.user);
+
+                    // Remove from index — position is now closed
+                    if tracked {
+                        user_index.write().await.remove(&ev.user);
+                    }
+                    pending_liquidations.remove(&ev.user);
+
+                    // Look up debt token decimals for display
+                    let debt_sym = TOKENS.iter().chain(RADIANT_TOKENS.iter())
+                        .find(|(a, _, _)| *a == ev.debtAsset)
+                        .map(|(_, s, _)| *s)
+                        .unwrap_or("???");
+                    let debt_dec = TOKENS.iter().chain(RADIANT_TOKENS.iter())
+                        .find(|(a, _, _)| *a == ev.debtAsset)
+                        .map(|(_, _, d)| *d as u32)
+                        .unwrap_or(18);
+                    let debt_amt = ev.debtToCover.to::<u128>() as f64
+                        / 10f64.powi(debt_dec as i32);
+
+                    if is_ours {
+                        // Our own liquidation — already logged by the liquidation path; skip duplicate
+                    } else if tracked {
+                        // Competitor liquidated a position we were tracking
+                        shared_missed.fetch_add(1, Ordering::Relaxed);
+                        let col_sym = TOKENS.iter().chain(RADIANT_TOKENS.iter())
+                            .find(|(a, _, _)| *a == ev.collateralAsset)
+                            .map(|(_, s, _)| *s)
+                            .unwrap_or("???");
+
+                        // Retrieve our last known HF for this user (already removed above)
+                        // We read it before the remove; use 0 as fallback if already gone.
+                        let last_hf = {
+                            let idx = user_index.read().await;
+                            idx.get(&ev.user)
+                                .map(|p| p.health_factor.to::<u128>() as f64 / 1e18)
+                                .unwrap_or(0.0)
+                        };
+                        let est_profit = debt_amt * 0.05; // ~5% liquidation bonus
+
+                        tracing::warn!(
+                            "😢 Missed [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.4} {debt_sym} col={col_sym} hf={last_hf:.4}",
+                            ev.user, ev.liquidator
+                        );
+
+                        // Push to buffer — will be flushed as one Telegram message after 8s
+                        missed_buffer.push(MissedEvent {
+                            user:         format!("{}", ev.user),
+                            liquidator:   format!("{}", ev.liquidator),
+                            debt_sym:     debt_sym.to_string(),
+                            debt_amt,
+                            col_sym:      col_sym.to_string(),
+                            protocol:     protocol.to_string(),
+                            tx_hash:      log.transaction_hash
+                                              .map(|h| format!("{h}"))
+                                              .unwrap_or_default(),
+                            last_hf,
+                            est_profit,
+                            untracked:    false,
+                            block_number: log.block_number.unwrap_or(0),
+                            debt_asset:   format!("{}", ev.debtAsset),
+                            col_asset:    format!("{}", ev.collateralAsset),
+                        });
+                        // Arm the flush timer on the FIRST event of a new batch (don't reset)
+                        if flush_deadline.is_none() {
+                            flush_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(8)
+                            );
+                        }
+                    } else if !is_ours && debt_amt >= 1_000.0 {
+                        // Position significative qu'on ne trackait pas — blind spot d'indexation.
+                        // (emprunté avant notre fenêtre 50k blocs, ou Borrow event raté)
+                        let col_sym = TOKENS.iter().chain(RADIANT_TOKENS.iter())
+                            .find(|(a, _, _)| *a == ev.collateralAsset)
+                            .map(|(_, s, _)| *s)
+                            .unwrap_or("???");
+                        let est_profit = debt_amt * 0.05;
+                        tracing::warn!(
+                            "🔍 Untracked liq [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.2} {debt_sym} col={col_sym} (non-indexé)",
+                            ev.user, ev.liquidator
+                        );
+                        missed_buffer.push(MissedEvent {
+                            user:         format!("{}", ev.user),
+                            liquidator:   format!("{}", ev.liquidator),
+                            debt_sym:     debt_sym.to_string(),
+                            debt_amt,
+                            col_sym:      col_sym.to_string(),
+                            protocol:     protocol.to_string(),
+                            tx_hash:      log.transaction_hash
+                                              .map(|h| format!("{h}"))
+                                              .unwrap_or_default(),
+                            last_hf:      0.0,
+                            est_profit,
+                            untracked:    true,
+                            block_number: log.block_number.unwrap_or(0),
+                            debt_asset:   format!("{}", ev.debtAsset),
+                            col_asset:    format!("{}", ev.collateralAsset),
+                        });
+                        if flush_deadline.is_none() {
+                            flush_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(8)
+                            );
+                        }
+                    }
+                    // else: liquidation d'une position non-trackée et < 1000$ — ignoré
+                }
+            }
+
+            // ── Flush missed-liquidation buffer after 8s of silence ──
+            // Uses pending() when buffer is empty so there is zero overhead on the hot path.
+            _ = async {
+                match flush_deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None     => futures_util::future::pending::<()>().await,
+                }
+            } => {
+                flush_deadline = None;
+                if !missed_buffer.is_empty() {
+                    let batch = std::mem::take(&mut missed_buffer);
+
+                    // Register competitors for tracked misses only (not indexing blind spots)
+                    let labels: HashMap<String, String> = {
+                        let mut reg = competitor_registry.write().await;
+                        let labels = batch.iter()
+                            .filter(|ev| !ev.untracked)
+                            .map(|ev| {
+                                let label = reg.record_miss(&ev.liquidator, &ev.debt_sym, ev.est_profit);
+                                (ev.liquidator.clone(), label)
+                            })
+                            .collect();
+                        reg.save();
+                        labels
+                    };
+
+                    // Append raw records to missed.json (unified view, includes untracked)
+                    let mut missed_log = competitors::MissedLog::load();
+                    missed_log.append_batch(&batch, &labels);
+
+                    // Append untracked-only records to untracked.json (dedicated analysis file)
+                    // Each record includes block_number + full asset addresses for offline diagnosis.
+                    // To find WHY a user wasn't indexed: look up their Borrow event before `block`.
+                    competitors::UntrackedLog::load().append_batch(&batch);
+
+                    if let Some(tg2) = tg.clone() {
+                        tokio::spawn(async move {
+                            tg2.notify_missed_batch(&batch, &labels).await;
+                        });
                     }
                 }
             }
@@ -2272,28 +2502,6 @@ mod tests {
         let fallback = result.unwrap_or_default();
         assert_eq!(fallback.last_saved_block, 0);
         assert!(fallback.addresses.is_empty());
-    }
-
-    // ── DEFAULT_LOOKBACK ───────────────────────────────────────
-
-    #[test]
-    fn test_default_lookback_covers_at_least_one_week() {
-        // Arbitrum ~0.25s/block → 4M blocks ≈ 11.6 days
-        // One week = 604_800s / 0.25s = 2_419_200 blocks
-        const ONE_WEEK_BLOCKS: u64 = 2_500_000;
-        assert!(
-            DEFAULT_LOOKBACK >= ONE_WEEK_BLOCKS,
-            "DEFAULT_LOOKBACK {DEFAULT_LOOKBACK} < 1 week ({ONE_WEEK_BLOCKS} blocks)"
-        );
-    }
-
-    #[test]
-    fn test_default_lookback_not_unreasonably_large() {
-        // 20M blocks at 0.25s = ~58 days. More than that makes cold-start too slow.
-        assert!(
-            DEFAULT_LOOKBACK <= 20_000_000,
-            "DEFAULT_LOOKBACK {DEFAULT_LOOKBACK} is too large (cold-start would be very slow)"
-        );
     }
 
     // ── QuoterV2 — logic (no RPC needed) ──────────────────────

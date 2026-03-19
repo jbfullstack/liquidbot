@@ -220,6 +220,82 @@ impl TelegramNotifier {
         self.send(&msg).await;
     }
 
+    /// Send a grouped summary of missed liquidations (buffered over 8s window).
+    /// `labels` maps full competitor address → label (e.g. "pb_01").
+    pub async fn notify_missed_batch(
+        &self,
+        events: &[crate::MissedEvent],
+        labels: &std::collections::HashMap<String, String>,
+    ) {
+        if events.is_empty() { return; }
+
+        let n = events.len();
+        let title = if n == 1 {
+            format!("{} 😢 <b>Opportunité manquée</b>", self.bot_name)
+        } else {
+            format!("{} 😢 <b>{n} opportunités manquées</b>", self.bot_name)
+        };
+
+        // Count by protocol
+        let av3 = events.iter().filter(|e| e.protocol == "AV3").count();
+        let rdt = events.iter().filter(|e| e.protocol == "RDT").count();
+        let proto_line = match (av3, rdt) {
+            (a, 0) => format!("[{a} Aave V3]"),
+            (0, r) => format!("[{r} Radiant V2]"),
+            (a, r) => format!("[{a} Aave V3 + {r} Radiant V2]"),
+        };
+
+        // Detect recurring competitor within this batch
+        let mut liq_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for e in events { *liq_counts.entry(e.liquidator.as_str()).or_insert(0) += 1; }
+        let top_liq = liq_counts.iter().max_by_key(|(_, c)| *c);
+        let recurring = top_liq
+            .filter(|(_, &c)| c > 1)
+            .map(|(addr, c)| {
+                let lbl = labels.get(*addr).map(|l| format!(" <b>{l}</b>")).unwrap_or_default();
+                format!("\n⚔️  <b>Concurrent récurrent:</b>{lbl} <code>{addr}</code> ({c}/{n})")
+            })
+            .unwrap_or_default();
+
+        // Total estimated profit missed
+        let total_est: f64 = events.iter().map(|e| e.est_profit).sum();
+        let profit_line = format!("\n💸 Profit estimé manqué: ~<b>${total_est:.2}</b>");
+
+        // Per-event lines
+        let mut lines = String::new();
+        for (i, e) in events.iter().enumerate() {
+            let user_s = &e.user[..e.user.len().min(12)];
+            let hf_str = if e.last_hf > 0.0 { format!("HF {:.4}", e.last_hf) } else { "HF ?".into() };
+            let tx_link = if e.tx_hash.is_empty() {
+                String::new()
+            } else {
+                format!(" <a href=\"https://arbiscan.io/tx/{}\">tx</a>", e.tx_hash)
+            };
+            if e.untracked {
+                // Position non-indexée : on n'était même pas en compétition
+                lines.push_str(&format!(
+                    "\n{}. 🔍 [{}] <code>{user_s}…</code> | {:.4} {} → {} | <i>non-indexé</i> | ~${:.2}{tx_link}",
+                    i + 1, e.protocol, e.debt_amt, e.debt_sym, e.col_sym, e.est_profit,
+                ));
+                lines.push_str(&format!("\n   🤖 <code>{}</code>", e.liquidator));
+            } else {
+                lines.push_str(&format!(
+                    "\n{}. [{}] <code>{user_s}…</code> | {:.4} {} → {} | {hf_str} | ~${:.2}{tx_link}",
+                    i + 1, e.protocol, e.debt_amt, e.debt_sym, e.col_sym, e.est_profit,
+                ));
+                // Always show full address + label for competitor analysis
+                let lbl = labels.get(&e.liquidator).map(|l| format!(" <b>{l}</b>")).unwrap_or_default();
+                let is_top = top_liq.map(|(a, _)| *a == e.liquidator.as_str()).unwrap_or(false);
+                if !is_top || n == 1 {
+                    lines.push_str(&format!("\n   ⚔️ {lbl} <code>{}</code>", e.liquidator));
+                }
+            }
+        }
+
+        let msg = format!("{title} {proto_line}{profit_line}\n{lines}{recurring}");
+        self.send(&msg).await;
+    }
+
     pub async fn notify_low_eth(&self, balance_eth: f64) {
         let msg = format!(
             "{} ⛽ <b>ETH bas !</b>\n\
@@ -288,7 +364,10 @@ impl TelegramNotifier {
     ///   /enable <id>        — activer un protocole
     ///   /disable <id>       — désactiver un protocole
     ///   /gas                — solde ETH + estimation jours restants
-    ///   /json               — télécharger stats.json
+    ///   /stats_json         — télécharger stats.json
+    ///   /missed_json        — télécharger missed.json
+    ///   /blind_spot [N]     — résumé des N derniers blind spots (défaut 10)
+    ///   /blind_spot_json    — télécharger untracked.json
     ///   /stop_bot           — suspendre liquidations
     ///   /start_bot          — reprendre liquidations
     ///   /pause_contract     — setPaused(true) on-chain
@@ -316,6 +395,10 @@ impl TelegramNotifier {
         eth_price: Arc<tokio::sync::RwLock<f64>>,
         // Protocol registry for /protocols, /enable, /disable
         protocol_registry: Arc<tokio::sync::RwLock<crate::protocols::ProtocolRegistry>>,
+        // Count of positions liquidated by competitors while we were tracking them
+        missed_count: Arc<std::sync::atomic::AtomicU32>,
+        // Competitor label registry (pb_01, pb_02…)
+        competitor_registry: Arc<tokio::sync::RwLock<crate::competitors::CompetitorStore>>,
     ) {
         // Separate client with long timeout for Telegram long-polling
         let poll_client = reqwest::Client::builder()
@@ -384,12 +467,14 @@ impl TelegramNotifier {
                             👥 Users suivis: {}\n\
                             ⚠️ À risque: {}\n\
                             ✅ Liquidations: {}\n\
+                            😢 Ratées (concurrence): {}\n\
                             💰 Profit total: <b>${:.2}</b>",
                             self.bot_name, status_icon,
                             hours, mins,
                             &hot_wallet[..hot_wallet.len().min(10)],
                             tracked, risk,
                             stats.total_successes(),
+                            missed_count.load(std::sync::atomic::Ordering::Relaxed),
                             stats.total_profit() - stats.total_gas(),
                         );
                         self.send(&msg).await;
@@ -412,8 +497,73 @@ impl TelegramNotifier {
                         self.send(&summary).await;
                     }
 
-                    "/json" | "/export" => {
+                    "/stats_json" | "/export" => {
                         self.send_document(&stats_path).await;
+                    }
+
+                    "/missed_json" => {
+                        self.send_document("missed.json").await;
+                    }
+
+                    "/blind_spot_json" => {
+                        self.send_document("untracked.json").await;
+                    }
+
+                    "/blind_spot" => {
+                        // Optional: /blind_spot 20 → show last 20 (default 10, max 30)
+                        let n: usize = text.split_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(10)
+                            .min(30);
+
+                        let log = crate::competitors::UntrackedLog::load();
+
+                        if log.records.is_empty() {
+                            self.send(&format!(
+                                "{} 🔍 <b>Blind spots</b>\n\nAucun blind spot enregistré.",
+                                self.bot_name
+                            )).await;
+                        } else {
+                            let total      = log.records.len();
+                            let total_profit: f64 = log.records.iter().map(|r| r.est_profit).sum();
+                            // Most recent first
+                            let shown: Vec<_> = log.records.iter().rev().take(n).collect();
+
+                            let mut lines = vec![
+                                format!(
+                                    "{} 🔍 <b>Blind spots</b> — {} total · ~<b>${total_profit:.2}</b> manqués",
+                                    self.bot_name, total
+                                ),
+                                format!("Derniers <b>{}</b> enregistrements :\n", shown.len()),
+                            ];
+
+                            for (i, r) in shown.iter().enumerate() {
+                                let date = &r.timestamp[..r.timestamp.len().min(10)];
+                                let liq_s = &r.liquidator[..r.liquidator.len().min(12)];
+                                let tx_link = if r.tx_hash.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" <a href=\"https://arbiscan.io/tx/{}\">tx</a>", r.tx_hash)
+                                };
+                                lines.push(format!(
+                                    "{}. [{}] {} | {:.2} {} → {} | ~${:.2}{}",
+                                    i + 1, r.protocol, date,
+                                    r.debt_amt, r.debt_sym, r.col_sym,
+                                    r.est_profit, tx_link,
+                                ));
+                                lines.push(format!(
+                                    "   bloc <code>{}</code> · liq <code>{liq_s}…</code>",
+                                    r.block,
+                                ));
+                            }
+
+                            if total > n {
+                                lines.push(format!("\n… et {} autres — /blind_spot_json pour tout", total - n));
+                            }
+
+                            self.send(&lines.join("\n")).await;
+                        }
                     }
 
                     "/gas" => {
@@ -725,6 +875,13 @@ impl TelegramNotifier {
                         std::process::exit(0);
                     }
 
+                    "/competitors" | "/concurrents" => {
+                        let reg = competitor_registry.read().await;
+                        let msg = reg.format_for_telegram(&self.bot_name);
+                        drop(reg);
+                        self.send(&msg).await;
+                    }
+
                     "/help" | "/start" => {
                         let msg = format!(
                             "{} 📖 <b>Commandes</b>\n\
@@ -732,9 +889,13 @@ impl TelegramNotifier {
                             /status — état du bot (up/down, uptime)\n\
                             /stats [id] — bilan P&amp;L (global ou par protocole)\n\
                             /hf [id] — positions à risque (filtre protocole optionnel)\n\
+                            /competitors — bots concurrents identifiés (labels pb_01…)\n\
                             /protocols — liste des protocoles + statut\n\
                             /gas — solde ETH + estimation ops/jours restants\n\
-                            /json — télécharger stats.json\n\
+                            /stats_json — télécharger stats.json\n\
+                            /missed_json — télécharger missed.json\n\
+                            /blind_spot [N] — derniers N blind spots (défaut 10)\n\
+                            /blind_spot_json — télécharger untracked.json\n\
                             \n\
                             <b>Protocoles:</b>\n\
                             /enable &lt;id&gt; — activer un protocole\n\
@@ -808,29 +969,34 @@ impl TelegramNotifier {
             .and_then(|u| u["update_id"].as_i64())
     }
 
-    /// Send a file as a Telegram document
+    /// Send a file as a Telegram document, using the actual filename from the path.
     async fn send_document(&self, file_path: &str) {
         let path = std::path::Path::new(file_path);
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file_path)
+            .to_string();
+
         if !path.exists() {
-            self.send("❌ stats.json introuvable").await;
+            self.send(&format!("❌ <code>{filename}</code> introuvable (aucune donnée encore)")).await;
             return;
         }
 
         let file_bytes = match tokio::fs::read(file_path).await {
             Ok(b) => b,
-            Err(_) => {
-                self.send("❌ Erreur lecture stats.json").await;
+            Err(e) => {
+                self.send(&format!("❌ Erreur lecture <code>{filename}</code>: {e}")).await;
                 return;
             }
         };
 
         let url = format!("https://api.telegram.org/bot{}/sendDocument", self.token);
-
+        let caption = format!("📁 {filename}");
         let form = reqwest::multipart::Form::new()
             .text("chat_id", self.chat_id.clone())
-            .text("caption", "📁 stats.json — historique complet")
+            .text("caption", caption)
             .part("document", reqwest::multipart::Part::bytes(file_bytes)
-                .file_name("stats.json")
+                .file_name(filename)
                 .mime_str("application/json")
                 .unwrap()
             );
