@@ -869,7 +869,19 @@ async fn main() -> Result<()> {
             .from_block(chunk_start)
             .to_block(chunk_end);
 
-        match http_ro.get_logs(&log_filter).await {
+        // Retry up to 3x with backoff — dRPC free tier occasionally returns 500/408
+        let mut logs_result = http_ro.get_logs(&log_filter).await;
+        for attempt in 1u32..=3 {
+            if logs_result.is_ok() { break; }
+            let delay = attempt * 3; // 3s, 6s, 9s
+            tracing::warn!(
+                "get_logs {chunk_start}-{chunk_end} failed (retry {attempt}/3 in {delay}s): {}",
+                logs_result.as_ref().unwrap_err()
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+            logs_result = http_ro.get_logs(&log_filter).await;
+        }
+        match logs_result {
             Ok(logs) => {
                 for log in &logs {
                     if let Ok(ev) = IAavePool::Borrow::decode_log_data(log.data()) {
@@ -877,10 +889,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            Err(e) => tracing::warn!("get_logs {chunk_start}-{chunk_end} failed: {e}"),
+            Err(e) => tracing::warn!("get_logs {chunk_start}-{chunk_end} abandonné après 3 essais: {e}"),
         }
         chunk_start = chunk_end + 1;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     // ── Radiant V2 Borrow event scan ──
@@ -895,7 +907,16 @@ async fn main() -> Result<()> {
                 .from_block(chunk_start)
                 .to_block(chunk_end);
 
-            match http_ro.get_logs(&log_filter).await {
+            let mut logs_result = http_ro.get_logs(&log_filter).await;
+            for attempt in 1u32..=3 {
+                if logs_result.is_ok() { break; }
+                let delay = attempt * 3; // 3s, 6s, 9s
+                tracing::warn!("Radiant get_logs {chunk_start}-{chunk_end} failed (retry {attempt}/3 in {delay}s): {}",
+                    logs_result.as_ref().unwrap_err());
+                tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                logs_result = http_ro.get_logs(&log_filter).await;
+            }
+            match logs_result {
                 Ok(logs) => {
                     for log in &logs {
                         if let Ok(ev) = IRadiantPool::Borrow::decode_log_data(log.data()) {
@@ -904,10 +925,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Radiant get_logs {chunk_start}-{chunk_end} failed: {e}"),
+                Err(e) => tracing::warn!("Radiant get_logs {chunk_start}-{chunk_end} abandonné après 3 essais: {e}"),
             }
             chunk_start = chunk_end + 1;
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         tracing::info!("Found {} Radiant V2 borrowers", radiant_borrowers.len());
     }
@@ -1553,6 +1574,23 @@ async fn main() -> Result<()> {
 
                 let bn = block.number;
                 last_block = bn;
+
+                // Log WebSocket latency every 1000 blocks (~4 min on Arbitrum).
+                // ws_lag = wall-clock now minus block timestamp (Arbitrum timestamps in seconds).
+                // Typical healthy range: 50-300ms. >1s = degraded RPC or network issue.
+                if bn % 1_000 == 0 {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let block_ts_ms = block.inner.timestamp * 1_000;
+                    let ws_lag_ms = now_ms.saturating_sub(block_ts_ms);
+                    if ws_lag_ms > 1_000 {
+                        tracing::warn!("📡 bloc #{bn} | WS lag {ws_lag_ms}ms ⚠️ (>1s — RPC lent ?)");
+                    } else {
+                        tracing::info!("📡 bloc #{bn} | WS lag {ws_lag_ms}ms");
+                    }
+                }
 
                 // Collect at-risk users, sorted by debt descending (biggest profit first).
                 // On Arbitrum FCFS, we want to attempt the most valuable position first.
