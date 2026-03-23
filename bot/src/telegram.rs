@@ -72,7 +72,13 @@ impl TelegramNotifier {
         eth_balance: f64,
         users_tracked: usize,
         at_risk: u32,
+        subgraph_new: usize,
     ) {
+        let subgraph_line = if subgraph_new > 0 {
+            format!("\n📊 Subgraph: <b>+{subgraph_new}</b> users historiques indexés")
+        } else {
+            String::new()
+        };
         let msg = format!(
             "{} <b>Bot démarré</b>\n\
             \n\
@@ -81,12 +87,24 @@ impl TelegramNotifier {
             📄 Contract: <code>{}</code>\n\
             ⛽ ETH: <b>{:.6} ETH</b>\n\
             👥 Users suivis: <b>{}</b>\n\
-            ⚠️ À risque: <b>{}</b>",
+            ⚠️ À risque: <b>{}</b>{}",
             self.bot_name,
             &hot_wallet[..hot_wallet.len().min(8)],
             &cold_wallet[..cold_wallet.len().min(8)],
             &contract[..contract.len().min(8)],
-            eth_balance, users_tracked, at_risk
+            eth_balance, users_tracked, at_risk, subgraph_line
+        );
+        self.send(&msg).await;
+    }
+
+    /// Notification de refresh périodique du subgraph (uniquement si nouveaux users).
+    /// Appelée depuis un `tokio::spawn` — fire-and-forget, non bloquant.
+    pub async fn notify_subgraph_refresh(&self, new_users: usize, total: usize) {
+        let msg = format!(
+            "{} 📊 <b>Subgraph refresh</b>\n\
+            ✅ +{new_users} nouveaux utilisateurs indexés\n\
+            👥 Total surveillé: <b>{total}</b>",
+            self.bot_name
         );
         self.send(&msg).await;
     }

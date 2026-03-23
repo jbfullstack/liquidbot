@@ -13,6 +13,9 @@ pub struct Config {
     pub eth_sweep_keep: f64, // ETH to keep after sweep (must be >= eth_keep)
     pub health_factor_threshold: f64,  // e.g. 1.05 — start watching
     pub scan_lookback_blocks: u64,     // blocks to scan at first start (no saved index)
+    /// Optionnel — URL GraphQL du subgraph Aave V3 pour le backfill historique.
+    /// Si None, le backfill subgraph est désactivé (le scan d'événements seul est utilisé).
+    pub aave_subgraph_url: Option<String>,
     pub telegram_token: String,
     pub telegram_chat_id: String,
 }
@@ -48,6 +51,9 @@ impl Config {
             scan_lookback_blocks: std::env::var("SCAN_LOOKBACK_BLOCKS")
                 .unwrap_or("4000000".into()).parse()
                 .map_err(|_| eyre!("SCAN_LOOKBACK_BLOCKS must be an integer"))?,
+            aave_subgraph_url: std::env::var("AAVE_SUBGRAPH_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
             telegram_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .unwrap_or_default(),
             telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID")

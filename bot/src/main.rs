@@ -6,6 +6,7 @@ mod competitors;
 mod config;
 mod protocols;
 mod stats;
+mod subgraph;
 mod telegram;
 
 use config::Config;
@@ -933,7 +934,58 @@ async fn main() -> Result<()> {
         tracing::info!("Found {} Radiant V2 borrowers", radiant_borrowers.len());
     }
 
-    tracing::info!("Found {} unique borrowers (all protocols)", borrowers.len());
+    tracing::info!("Found {} unique borrowers (event scan, all protocols)", borrowers.len());
+
+    // ── Subgraph backfill (optionnel, nécessite AAVE_SUBGRAPH_URL) ──────────
+    // Complète le scan d'événements avec l'historique complet depuis le déploiement
+    // d'Aave V3 sur Arbitrum (mars 2022). Capture les positions ouvertes avant la
+    // fenêtre de lookback (SCAN_LOOKBACK_BLOCKS) et jamais re-empruntées depuis.
+    //
+    // Non bloquant pour le démarrage si TheGraph est indisponible : erreur loguée
+    // en WARN, le bot continue avec le scan seul.
+    let subgraph_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_default();
+
+    // Les users du subgraph sont stockés séparément — ils n'entrent PAS dans le loop
+    // HF séquentiel ci-dessous (qui ferait N appels RPC individuels × 90k users = ~1h).
+    // Ils sont insérés directement dans user_index après le loop, avec HF=MAX et
+    // next_refresh_at=0. Le main loop les couvrira via Multicall3 à 100/bloc (~4 min).
+    let mut subgraph_addrs: Vec<Address> = Vec::new();
+
+    let subgraph_new_users = if let Some(ref url) = cfg.aave_subgraph_url {
+        tracing::info!("📊 Subgraph backfill: interrogation de {} ...", url);
+        match subgraph::fetch_aave_borrowers(&subgraph_client, url).await {
+            Ok(addrs) => {
+                // Dédupliquer par rapport au scan d'événements déjà dans borrowers
+                let added = addrs.iter().filter(|a| !borrowers.contains(*a)).count();
+                subgraph_addrs = addrs;
+                tracing::info!(
+                    "📊 Subgraph backfill: {added} nouveaux (hors scan d'événements) — \
+                     indexés directement sans HF check individuel"
+                );
+                added
+            }
+            Err(e) => {
+                tracing::warn!("📊 Subgraph backfill échoué — le bot continue sans: {e}");
+                0
+            }
+        }
+    } else {
+        tracing::info!(
+            "📊 Subgraph backfill désactivé (AAVE_SUBGRAPH_URL non défini). \
+             Seul le scan d'événements ({} blocs) est utilisé.",
+            cfg.scan_lookback_blocks
+        );
+        0
+    };
+
+    tracing::info!(
+        "HF check: {} adresses (scan événements). \
+         {} adresses subgraph ajoutées directement à l'index.",
+        borrowers.len(), subgraph_addrs.len()
+    );
 
     // Batch health factor checks
     let hf_thresh = U256::from((cfg.health_factor_threshold * 1e18) as u128);
@@ -965,8 +1017,24 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    // ── Injection directe des users subgraph dans l'index ───────────────────
+    // HF = MAX, next_refresh_at = 0 → le main loop les priorise immédiatement.
+    // index_borrower() utilise or_insert() → n'écrase pas les users déjà présents
+    // avec leur HF frais issu du loop ci-dessus.
+    if !subgraph_addrs.is_empty() {
+        let mut idx = user_index.write().await;
+        for addr in subgraph_addrs {
+            index_borrower(&mut idx, addr);
+        }
+        tracing::info!(
+            "📊 Subgraph: {} users injectés dans l'index (HF=MAX, refresh immédiat)",
+            subgraph_new_users
+        );
+    }
+
     let tracked = user_index.read().await.len();
-    tracing::info!("✅ {tracked} users tracked, {at_risk} at risk");
+    tracing::info!("✅ {tracked} users trackés au total, {at_risk} déjà à risque (HF<{:.2})",
+        cfg.health_factor_threshold);
 
     // Notify startup
     if let Some(ref tg) = tg {
@@ -976,6 +1044,7 @@ async fn main() -> Result<()> {
             &cfg.contract_address,
             eth_bal,
             tracked, at_risk,
+            subgraph_new_users,
         ).await;
     }
 
@@ -1106,6 +1175,13 @@ async fn main() -> Result<()> {
     // ── Missed-liquidation buffer: groups events within a 8s window ──
     let mut missed_buffer: Vec<MissedEvent> = Vec::new();
     let mut flush_deadline: Option<tokio::time::Instant> = None;
+
+    // ── Subgraph refresh périodique ─────────────────────────────────────────
+    // 28 800 blocs ≈ 2h sur Arbitrum (0.25s/bloc). Capture les nouvelles positions
+    // ouvertes via contrats intermédiaires (pas d'event Borrow direct) + gaps WS.
+    // Survit aux reconnexions : last_subgraph_refresh_block persiste hors du 'reconnect loop.
+    const SUBGRAPH_REFRESH_BLOCKS: u64 = 28_800;
+    let mut last_subgraph_refresh_block: u64 = 0;
 
 
     // ── Priority refresh: users are refreshed based on their HF proximity to 1.0 ──
@@ -1370,14 +1446,33 @@ async fn main() -> Result<()> {
                         }
                     } else if !is_ours && debt_amt >= 1_000.0 {
                         // Position significative qu'on ne trackait pas — blind spot d'indexation.
-                        // (emprunté avant notre fenêtre 50k blocs, ou Borrow event raté)
+                        // (emprunté avant notre fenêtre de lookback, ou Borrow event manqué sur WS)
                         let col_sym = TOKENS.iter().chain(RADIANT_TOKENS.iter())
                             .find(|(a, _, _)| *a == ev.collateralAsset)
                             .map(|(_, s, _)| *s)
                             .unwrap_or("???");
                         let est_profit = debt_amt * 0.05;
+
+                        // ── Option C : re-indexer immédiatement ─────────────────────
+                        // L'user vient d'être liquidé mais peut avoir d'autres positions.
+                        // remove_if_repaid() nettoiera au prochain getUserAccountData si
+                        // la dette est tombée à 0. Coût : une écriture HashMap + une
+                        // lecture RPC au prochain cycle de refresh — quasi nul.
+                        let user_protocol_str = if log.address() == RADIANT_POOL {
+                            "Radiant V2"
+                        } else {
+                            "Aave V3"
+                        };
+                        {
+                            let mut idx = user_index.write().await;
+                            index_borrower(&mut idx, ev.user);
+                            if let Some(pos) = idx.get_mut(&ev.user) {
+                                pos.protocol = user_protocol_str.to_string();
+                            }
+                        }
+
                         tracing::warn!(
-                            "🔍 Untracked liq [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.2} {debt_sym} col={col_sym} (non-indexé)",
+                            "🔍 BLIND_SPOT [{protocol}] user={:.8} liq={:.8} debt={debt_amt:.2} {debt_sym} col={col_sym} ~${est_profit:.2} — re-indexé [{user_protocol_str}]",
                             ev.user, ev.liquidator
                         );
                         missed_buffer.push(MissedEvent {
@@ -1822,6 +1917,47 @@ async fn main() -> Result<()> {
                                 ).await;
                             });
                         }
+                    }
+                }
+
+                // ── Subgraph refresh périodique (~2h) ────────────────────────────
+                // Lancé en background (tokio::spawn) pour ne pas bloquer le select!.
+                // Ajoute uniquement les adresses absentes de l'index — idempotent.
+                // Notification Telegram uniquement si de nouveaux users sont trouvés.
+                if let Some(ref url) = cfg.aave_subgraph_url {
+                    if last_subgraph_refresh_block == 0
+                        || bn >= last_subgraph_refresh_block + SUBGRAPH_REFRESH_BLOCKS
+                    {
+                        last_subgraph_refresh_block = bn;
+                        let idx2     = user_index.clone();
+                        let url2     = url.clone();
+                        let client2  = subgraph_client.clone();
+                        let tg2      = tg.clone();
+                        tokio::spawn(async move {
+                            match subgraph::fetch_aave_borrowers(&client2, &url2).await {
+                                Ok(addrs) => {
+                                    let mut idx = idx2.write().await;
+                                    let before  = idx.len();
+                                    for addr in addrs {
+                                        index_borrower(&mut idx, addr);
+                                    }
+                                    let added = idx.len() - before;
+                                    let total = idx.len();
+                                    drop(idx); // libère le verrou avant l'appel réseau
+                                    if added > 0 {
+                                        tracing::info!(
+                                            "📊 Subgraph refresh: +{added} nouveaux (total: {total})"
+                                        );
+                                        if let Some(tg) = tg2 {
+                                            tg.notify_subgraph_refresh(added, total).await;
+                                        }
+                                    } else {
+                                        tracing::debug!("📊 Subgraph refresh: aucun nouveau user");
+                                    }
+                                }
+                                Err(e) => tracing::warn!("📊 Subgraph refresh échoué: {e}"),
+                            }
+                        });
                     }
                 }
 
