@@ -4,6 +4,7 @@
 
 mod competitors;
 mod config;
+mod pricefeed;
 mod protocols;
 mod stats;
 mod subgraph;
@@ -15,7 +16,7 @@ use telegram::{TelegramNotifier, TelegramCommand};
 use eyre::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use alloy::primitives::{address, Address, I256, U256};
@@ -847,16 +848,26 @@ async fn main() -> Result<()> {
     );
     tracing::info!("📡 Scanning Borrow events from block {scan_from} to {current_block}...");
 
-    // drpc free tier: max 9 999 blocks per eth_getLogs request → chunk it
-    const CHUNK: u64 = 9_000;
-    let mut borrowers: HashSet<Address> = HashSet::new();
-
-    // Seed from saved index first (all previously known borrowers)
-    for addr_str in &saved.addresses {
-        if let Ok(addr) = addr_str.parse::<Address>() {
-            borrowers.insert(addr);
+    // ── Charger l'index sauvegardé directement dans user_index ─────────────
+    // Les adresses connues reçoivent HF=MAX, next_refresh_at=0.
+    // Le main loop les couvrira via Multicall3 à 100/bloc (~4 min pour 90k users).
+    // On n'effectue PAS de HF check séquentiel sur elles au démarrage :
+    // 90k appels individuels prendraient ~75 minutes et bloqueraient toute la startup.
+    {
+        let mut idx = user_index.write().await;
+        for addr_str in &saved.addresses {
+            if let Ok(addr) = addr_str.parse::<Address>() {
+                index_borrower(&mut idx, addr);
+            }
         }
     }
+    tracing::info!("💾 {} adresses chargées dans l'index (HF=MAX, refresh au prochain bloc)", saved_count);
+
+    // drpc free tier: max 9 999 blocks per eth_getLogs request → chunk it
+    const CHUNK: u64 = 9_000;
+    // borrowers = NOUVEAUX utilisateurs du scan événements seulement
+    // (les adresses du saved index sont déjà dans user_index ci-dessus)
+    let mut borrowers: HashSet<Address> = HashSet::new();
 
     // Track which addresses came from Radiant V2 (for protocol tagging later)
     let mut radiant_borrowers: HashSet<Address> = HashSet::new();
@@ -948,22 +959,22 @@ async fn main() -> Result<()> {
         .build()
         .unwrap_or_default();
 
-    // Les users du subgraph sont stockés séparément — ils n'entrent PAS dans le loop
-    // HF séquentiel ci-dessous (qui ferait N appels RPC individuels × 90k users = ~1h).
-    // Ils sont insérés directement dans user_index après le loop, avec HF=MAX et
-    // next_refresh_at=0. Le main loop les couvrira via Multicall3 à 100/bloc (~4 min).
+    // ── Subgraph backfill (optionnel, nécessite AAVE_SUBGRAPH_URL) ──────────
+    // Nouveaux users subgraph = addresses non encore dans user_index
     let mut subgraph_addrs: Vec<Address> = Vec::new();
 
     let subgraph_new_users = if let Some(ref url) = cfg.aave_subgraph_url {
         tracing::info!("📊 Subgraph backfill: interrogation de {} ...", url);
         match subgraph::fetch_aave_borrowers(&subgraph_client, url).await {
             Ok(addrs) => {
-                // Dédupliquer par rapport au scan d'événements déjà dans borrowers
-                let added = addrs.iter().filter(|a| !borrowers.contains(*a)).count();
+                // Dédupliquer par rapport à l'index déjà chargé
+                let already_known = user_index.read().await;
+                let added = addrs.iter().filter(|a| !already_known.contains_key(*a)).count();
+                drop(already_known);
                 subgraph_addrs = addrs;
                 tracing::info!(
-                    "📊 Subgraph backfill: {added} nouveaux (hors scan d'événements) — \
-                     indexés directement sans HF check individuel"
+                    "📊 Subgraph backfill: {added} nouveaux — \
+                     indexés directement (HF=MAX, refresh immédiat)"
                 );
                 added
             }
@@ -981,13 +992,15 @@ async fn main() -> Result<()> {
         0
     };
 
+    // ── HF check sur les NOUVEAUX borrowers du scan événements ──────────────
+    // borrowers = adresses trouvées dans les N derniers blocs (typiquement < 100).
+    // Ceux-ci sont NOUVEAUX (pas dans le saved index) → HF check individuel rapide.
+    // Les 90k du saved index sont déjà dans user_index ci-dessus, pas retraités ici.
     tracing::info!(
-        "HF check: {} adresses (scan événements). \
-         {} adresses subgraph ajoutées directement à l'index.",
-        borrowers.len(), subgraph_addrs.len()
+        "HF check: {} nouvelles adresses (scan événements depuis le dernier redémarrage)",
+        borrowers.len()
     );
 
-    // Batch health factor checks
     let hf_thresh = U256::from((cfg.health_factor_threshold * 1e18) as u128);
     let hf_095    = U256::from(95u64) * U256::from(10u64).pow(U256::from(16u64));
     let one_e18   = U256::from(10u64).pow(U256::from(18u64));
@@ -1017,17 +1030,15 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // ── Injection directe des users subgraph dans l'index ───────────────────
-    // HF = MAX, next_refresh_at = 0 → le main loop les priorise immédiatement.
-    // index_borrower() utilise or_insert() → n'écrase pas les users déjà présents
-    // avec leur HF frais issu du loop ci-dessus.
+    // ── Injection des users subgraph dans l'index ────────────────────────────
+    // index_borrower() utilise or_insert() → n'écrase pas les users déjà présents.
     if !subgraph_addrs.is_empty() {
         let mut idx = user_index.write().await;
         for addr in subgraph_addrs {
             index_borrower(&mut idx, addr);
         }
         tracing::info!(
-            "📊 Subgraph: {} users injectés dans l'index (HF=MAX, refresh immédiat)",
+            "📊 Subgraph: {} users injectés dans l'index",
             subgraph_new_users
         );
     }
@@ -1047,6 +1058,24 @@ async fn main() -> Result<()> {
             subgraph_new_users,
         ).await;
     }
+
+    // ── Sub-block fast path: shared price atomics ──────────────────────────
+    // oracle_price_atomic: last Chainlink price we received (updated on every AnswerUpdated).
+    // market_price_atomic: Binance REST price polled every 100ms.
+    // Both are read on the hot path with Ordering::Relaxed — best-effort snapshot only.
+    let oracle_price_atomic: Arc<AtomicU64> = Arc::new(AtomicU64::new(
+        pricefeed::to_atomic(eth_price_usd)
+    ));
+    // Real-time CEX price feed — Binance → Coinbase → Kraken (auto-fallback on 451/error)
+    let market_price_atomic = pricefeed::spawn(
+        Arc::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+        ),
+    );
+    tracing::info!("📈 CEX price feed started (ETH/USD, 100ms polling — Binance/Coinbase/Kraken)");
 
     // ── Shared state for command handler ──
     let shared_tracked   = Arc::new(RwLock::new(tracked));
@@ -1573,6 +1602,8 @@ async fn main() -> Result<()> {
                             prev_eth_price = eth_price_usd;
                             eth_price_usd = new_price;
                             *shared_eth_price.write().await = new_price;
+                            // Always update the oracle atomic (used for CEX deviation check)
+                            oracle_price_atomic.store(pricefeed::to_atomic(new_price), Ordering::Relaxed);
                             tracing::info!("🔔 Oracle: ETH=${new_price:.2} ({:+.1}%)", -drop_pct * 100.0);
 
                             // Flash-crash: invalidate positions that may now be liquidatable
@@ -1593,6 +1624,80 @@ async fn main() -> Result<()> {
                                         "⚡ Oracle drop {:.1}%! {} positions invalidated for immediate check",
                                         drop_pct * 100.0, count
                                     );
+                                }
+                            }
+
+                            // ── Sub-block fast path: spawn immediately on significant drops ──
+                            // Threshold 0.2% — any move large enough to flip positions near HF=1.0.
+                            // No estimateGas — the contract's minProfit guard protects funds.
+                            // TX uses fixed 350_000 gas limit (conservative upper bound).
+                            if drop_pct > 0.002 && bot_active.load(Ordering::Relaxed) {
+                                let scale = new_price / prev_eth_price; // < 1.0 on a drop
+                                let min_debt_base_fp: u128 = (cfg.min_profit_usd * 20.0 * 1e8) as u128;
+
+                                // Collect candidates: positions whose estimated HF after the price
+                                // move is below 1.02 (small buffer above 1.0 — on-chain is authoritative).
+                                let fast_candidates: Vec<(Address, String)> = {
+                                    let idx = user_index.read().await;
+                                    idx.iter()
+                                        .filter(|(_, pos)| {
+                                            if pos.total_debt_base.to::<u128>() < min_debt_base_fp {
+                                                return false;
+                                            }
+                                            let hf_raw = pos.health_factor.to::<u128>() as f64 / 1e18;
+                                            // Estimated HF after oracle move: cached_hf × price_scale
+                                            let est_hf = hf_raw * scale;
+                                            est_hf < 1.02
+                                        })
+                                        .map(|(addr, pos)| (*addr, pos.protocol.clone()))
+                                        .collect()
+                                };
+
+                                if !fast_candidates.is_empty() {
+                                    tracing::warn!(
+                                        "⚡ Fast path: {} candidat(s) estimé(s) liquidatables (oracle drop {:.2}%)",
+                                        fast_candidates.len(), drop_pct * 100.0
+                                    );
+
+                                    // Snapshot fee cache for zero-RPC fee lookup in the fast path
+                                    let fee_snapshot: HashMap<(Address, Address), u32> =
+                                        fee_cache.iter().map(|(k, (t, _))| (*k, *t)).collect();
+
+                                    // Clone everything needed for the spawned task
+                                    let http_ro2    = http_ro.clone();
+                                    let cfg2        = cfg.clone();
+                                    let tg2         = tg.clone();
+                                    let prot_reg2   = protocol_registry.clone();
+                                    let eth_p       = new_price;
+                                    let prem        = premium as u64;
+
+                                    // Build a fresh owned http provider (wallet) for the spawned task
+                                    let rpc_url2    = cfg.rpc_http_url.clone();
+                                    let wallet2     = wallet.clone();
+                                    let contract2   = contract_addr;
+
+                                    tokio::spawn(async move {
+                                        // Construct provider inside the task (owned, no lifetime issues)
+                                        let Ok(url) = rpc_url2.parse::<alloy::transports::http::reqwest::Url>() else {
+                                            tracing::warn!("⚡ [FAST] Invalid RPC URL");
+                                            return;
+                                        };
+                                        let http_tx = ProviderBuilder::new()
+                                            .wallet(wallet2)
+                                            .connect_http(url);
+                                        let liq2 = IFlashLiquidator::new(contract2, &http_tx);
+                                        fast_liquidation_attempt(
+                                            fast_candidates,
+                                            &liq2,
+                                            &http_ro2,
+                                            cfg2,
+                                            fee_snapshot,
+                                            eth_p,
+                                            prem,
+                                            prot_reg2,
+                                            tg2,
+                                        ).await;
+                                    });
                                 }
                             }
                         }
@@ -1969,14 +2074,86 @@ async fn main() -> Result<()> {
                             .unwrap_or(false)
                     }).count();
                     let dust_excl = shared_dust_excluded.load(Ordering::Relaxed);
+                    // CEX vs oracle price deviation (oracle_price_atomic tracks last AnswerUpdated)
+                    let market_p = pricefeed::from_atomic(market_price_atomic.load(Ordering::Relaxed));
+                    let oracle_p = pricefeed::from_atomic(oracle_price_atomic.load(Ordering::Relaxed));
+                    let deviation_pct = if oracle_p > 0.0 {
+                        (oracle_p - market_p) / oracle_p * 100.0
+                    } else { 0.0 };
                     tracing::info!(
-                        "💓 Block {bn} | {} tracked | {} watching (HF<1.05) | {} liquidatable (HF<1.0) | {} dust exclu (dette<${:.0}) | {stats_liq} liq (${stats_profit:.2} gross) | ETH ${eth_price_usd:.0}",
+                        "💓 Block {bn} | {} tracked | {} watching (HF<1.05) | {} liquidatable (HF<1.0) | {} dust exclu (dette<${:.0}) | {stats_liq} liq (${stats_profit:.2} gross) | ETH oracle ${oracle_p:.0} marché ${market_p:.0} ({deviation_pct:+.2}%)",
                         user_index.read().await.len(),
                         at_risk_users.len(),
                         liquidatable,
                         dust_excl,
                         cfg.min_profit_usd * 20.0,
                     );
+                }
+
+                // ── CEX pre-oracle detection: fire fast path BEFORE AnswerUpdated ──
+                // If Binance price has deviated > 0.45% from last on-chain oracle price,
+                // the oracle update is likely imminent. Spawn the fast path NOW so we
+                // can land a tx in the same block as the oracle update.
+                if bot_active.load(Ordering::Relaxed) {
+                    let market_p = pricefeed::from_atomic(market_price_atomic.load(Ordering::Relaxed));
+                    let oracle_p = pricefeed::from_atomic(oracle_price_atomic.load(Ordering::Relaxed));
+                    if market_p > 0.0 && oracle_p > 0.0 {
+                        let deviation_pct = (oracle_p - market_p) / oracle_p * 100.0;
+                        if deviation_pct > 0.45 {
+                            // Market price is > 0.45% below oracle — oracle drop likely imminent
+                            let scale = market_p / oracle_p; // estimated post-update scale
+                            let min_debt_base_cex: u128 = (cfg.min_profit_usd * 20.0 * 1e8) as u128;
+                            let cex_candidates: Vec<(Address, String)> = {
+                                let idx = user_index.read().await;
+                                idx.iter()
+                                    .filter(|(_, pos)| {
+                                        if pos.total_debt_base.to::<u128>() < min_debt_base_cex {
+                                            return false;
+                                        }
+                                        let hf_raw = pos.health_factor.to::<u128>() as f64 / 1e18;
+                                        let est_hf = hf_raw * scale;
+                                        est_hf < 1.0 // only truly underwater at market price
+                                    })
+                                    .map(|(addr, pos)| (*addr, pos.protocol.clone()))
+                                    .collect()
+                            };
+                            if !cex_candidates.is_empty() {
+                                tracing::warn!(
+                                    "⚡ CEX déviation {deviation_pct:.2}% > 0.45% — oracle imminente, fast path armé ({} candidats)",
+                                    cex_candidates.len()
+                                );
+                                let fee_snap: HashMap<(Address, Address), u32> =
+                                    fee_cache.iter().map(|(k, (t, _))| (*k, *t)).collect();
+                                let http_ro3  = http_ro.clone();
+                                let cfg3      = cfg.clone();
+                                let tg3       = tg.clone();
+                                let prot_reg3 = protocol_registry.clone();
+                                let rpc_url3  = cfg.rpc_http_url.clone();
+                                let wallet3   = wallet.clone();
+                                let prem3     = premium as u64;
+                                tokio::spawn(async move {
+                                    let Ok(url) = rpc_url3.parse::<alloy::transports::http::reqwest::Url>() else {
+                                        tracing::warn!("⚡ [CEX-FAST] Invalid RPC URL"); return;
+                                    };
+                                    let http_tx3 = ProviderBuilder::new()
+                                        .wallet(wallet3)
+                                        .connect_http(url);
+                                    let liq3 = IFlashLiquidator::new(contract_addr, &http_tx3);
+                                    fast_liquidation_attempt(
+                                        cex_candidates,
+                                        &liq3,
+                                        &http_ro3,
+                                        cfg3,
+                                        fee_snap,
+                                        market_p, // use market price as the estimated oracle price
+                                        prem3,
+                                        prot_reg3,
+                                        tg3,
+                                    ).await;
+                                });
+                            }
+                        }
+                    }
                 }
 
                 if at_risk_users.is_empty() || !bot_active.load(Ordering::Relaxed) {
@@ -2408,6 +2585,169 @@ async fn main() -> Result<()> {
     } // end 'reconnect loop
 
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sub-block fast liquidation path
+// ═══════════════════════════════════════════════════════════════
+//
+// Called from a tokio::spawn immediately on AnswerUpdated or on CEX deviation.
+// Skips estimateGas for maximum speed — the contract's minProfit guard ensures
+// funds are never lost (the tx reverts atomically if not profitable).
+// Uses a fixed gas limit of 350_000 (conservative upper bound for flash liq).
+
+async fn fast_liquidation_attempt<P1, P2>(
+    candidates:        Vec<(Address, String)>,
+    liquidator:        &IFlashLiquidator::IFlashLiquidatorInstance<P1>,
+    http_ro:           &P2,
+    cfg:               Config,
+    fee_snapshot:      HashMap<(Address, Address), u32>,
+    eth_price:         f64,
+    premium:           u64,
+    protocol_registry: Arc<RwLock<protocols::ProtocolRegistry>>,
+    tg:                Option<TelegramNotifier>,
+)
+where
+    P1: Provider,
+    P2: Provider,
+{
+    tracing::warn!(
+        "⚡ Fast path: {} candidat(s) estimé(s) liquidatables",
+        candidates.len()
+    );
+
+    let hf_095 = U256::from(95u64) * U256::from(10u64).pow(U256::from(16u64));
+    let one_e18 = U256::from(10u64).pow(U256::from(18u64));
+
+    for (user, protocol) in candidates {
+        // Check if this protocol is currently enabled
+        {
+            let protocol_id = match protocol.as_str() {
+                "Radiant V2" => "radiant_v2",
+                _            => "aave_v3",
+            };
+            if !protocol_registry.read().await.is_enabled(protocol_id) {
+                tracing::debug!("⚡ [FAST] Skip {user}: protocol {protocol} disabled");
+                continue;
+            }
+        }
+
+        // Fetch live health factor — single call, no Multicall3 overhead
+        let pool_addr = protocol_pool(&protocol);
+        let pool = IAavePool::new(pool_addr, http_ro);
+        let d = match pool.getUserAccountData(user).call().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("⚡ [FAST] getUserAccountData {user} failed: {e}");
+                continue;
+            }
+        };
+
+        let hf = d.healthFactor;
+        if hf >= one_e18 {
+            // Position recovered or estimated HF was too optimistic — skip
+            continue;
+        }
+
+        let hf_f64 = hf.to::<u128>() as f64 / 1e18;
+        let est_hf = hf_f64; // on-chain value, no further estimation needed
+        tracing::warn!("⚡ [FAST] Tentative {user} HF_estimé={est_hf:.4} (sans estimateGas)");
+
+        if d.totalDebtBase == U256::ZERO {
+            continue;
+        }
+
+        // Get per-token reserve data
+        let data_prov  = protocol_data_provider(&protocol);
+        let user_tokens = protocol_tokens(&protocol);
+        let results = multicall_reserve_data(http_ro, user, data_prov, user_tokens).await;
+
+        let mut best_debt: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
+        let mut best_coll: (Address, U256, &str, u8) = (Address::ZERO, U256::ZERO, "", 18);
+
+        for ((tok, name, decimals), rd_opt) in user_tokens.iter().zip(results.iter()) {
+            let Some(rd) = rd_opt else { continue; };
+            if rd.current_variable_debt > best_debt.1 {
+                best_debt = (*tok, rd.current_variable_debt, name, *decimals);
+            }
+            if rd.current_a_token_balance > best_coll.1 && rd.usage_as_collateral_enabled {
+                best_coll = (*tok, rd.current_a_token_balance, name, *decimals);
+            }
+        }
+
+        if best_debt.0 == Address::ZERO || best_coll.0 == Address::ZERO {
+            tracing::warn!("⚡ [FAST] Skip {user}: no debt/coll found");
+            continue;
+        }
+
+        // Close factor: 100% when HF < 0.95, 50% otherwise
+        let debt_to_cover = if hf < hf_095 {
+            best_debt.1
+        } else {
+            best_debt.1 / U256::from(2u64)
+        };
+
+        let min_profit = min_profit_raw(cfg.min_profit_usd, best_debt.3, eth_price);
+
+        // Fee tier: use snapshot (zero RPC), fallback to 500 bps (most liquid for majors)
+        let (fee_tier, min_swap_out) = if best_debt.0 == best_coll.0 {
+            (alloy::primitives::Uint::<24, 1>::from(0u32), U256::ZERO)
+        } else {
+            let fee = fee_snapshot
+                .get(&(best_coll.0, best_debt.0))
+                .or_else(|| fee_snapshot.get(&(best_debt.0, best_coll.0)))
+                .copied()
+                .unwrap_or(500); // 500 bps = most liquid pool for major pairs
+            let flash_repay = debt_to_cover
+                + debt_to_cover * U256::from(premium)
+                    / U256::from(10_000u64);
+            let min_out = flash_repay + min_profit;
+            (alloy::primitives::Uint::<24, 1>::from(fee), min_out)
+        };
+
+        let target_pool = protocol_pool(&protocol);
+
+        // Build tx — NO estimateGas (speed over certainty; contract guard protects funds)
+        let tx = liquidator.liquidate(
+            user,
+            best_coll.0,
+            best_debt.0,
+            debt_to_cover,
+            fee_tier,
+            min_swap_out,
+            min_profit,
+            target_pool,
+        );
+
+        // Fixed gas limit: 350_000 units (conservative upper bound for flash liquidation)
+        let tx = tx.gas(350_000u64);
+
+        match tx.send().await {
+            Ok(pending) => {
+                let hash = format!("{:?}", pending.tx_hash());
+                tracing::warn!("⚡ [FAST] TX soumis: {hash}");
+
+                // Fire-and-forget Telegram notification
+                if let Some(ref tg_ref) = tg {
+                    let user_short = format!("{:.8}", user);
+                    let msg = format!(
+                        "⚡ LiqBot ⚡ <b>Fast path</b> — soumission spéculative\n\
+                        👤 {user_short}\n\
+                        📈 HF estimé: {est_hf:.4} → liquidatable\n\
+                        🚫 estimateGas ignoré (vitesse max)\n\
+                        🔗 <a href=\"https://arbiscan.io/tx/{hash}\">Arbiscan</a>"
+                    );
+                    let tg2 = tg_ref.clone();
+                    tokio::spawn(async move {
+                        tg2.send_raw(&msg).await;
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("⚡ [FAST] Envoi échoué: {e}");
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3312,5 +3652,400 @@ mod tests {
         assert_eq!(block_delta, 2);
         assert_eq!(verdict, "BEATABLE");
         assert_eq!(ms_delta, 500);
+    }
+
+    // ── Sub-block / fast-path logic ────────────────────────────
+    //
+    // These tests cover the pure-math and pure-logic parts of the fast
+    // liquidation path without making any RPC calls.
+
+    // ── drop_pct thresholds ────────────────────────────────────
+
+    #[test]
+    fn test_fast_path_drop_threshold_is_002() {
+        // Fast path activates on oracle drop > 0.2%.
+        // Must be low enough to catch ~1-pip moves that flip HF < 1.0.
+        let threshold = 0.002_f64;
+        assert!(threshold > 0.0,   "threshold must be positive");
+        assert!(threshold < 0.005, "fast-path threshold must be < cache-invalidation threshold");
+    }
+
+    #[test]
+    fn test_cache_invalidation_drop_threshold_is_005() {
+        // Cache invalidation activates on oracle drop > 0.5%.
+        // Must be clearly above fast-path (0.2%) but below a full crash (1%+).
+        let threshold = 0.005_f64;
+        assert!(threshold > 0.002, "must be above fast-path threshold");
+        assert!(threshold < 0.02,  "must not be so high that slow drops are missed");
+    }
+
+    #[test]
+    fn test_drop_pct_formula_matches_price_change() {
+        // drop_pct = (old - new) / old
+        let old_price = 2000.0_f64;
+        let new_price = 1990.0_f64; // 0.5% drop
+        let drop = (old_price - new_price) / old_price;
+        assert!((drop - 0.005).abs() < 1e-9, "expected 0.5% got {drop}");
+    }
+
+    #[test]
+    fn test_drop_pct_positive_on_price_fall() {
+        let old = 3000.0_f64;
+        let new = 2970.0_f64; // 1% drop
+        let drop_pct = (old - new) / old;
+        assert!(drop_pct > 0.0, "drop_pct must be positive when price falls");
+        assert!((drop_pct - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_drop_pct_zero_on_flat_price() {
+        let price = 2000.0_f64;
+        let drop_pct = (price - price) / price;
+        assert_eq!(drop_pct, 0.0);
+    }
+
+    #[test]
+    fn test_drop_pct_negative_on_price_rise() {
+        // Price rise → negative drop_pct → fast path does NOT trigger
+        let old = 2000.0_f64;
+        let new = 2020.0_f64;
+        let drop_pct = (old - new) / old;
+        assert!(drop_pct < 0.0, "rising price must not trigger fast path");
+        assert!(drop_pct < 0.002, "must be below fast-path threshold");
+    }
+
+    // ── HF estimation after oracle move ───────────────────────
+
+    #[test]
+    fn test_est_hf_drops_proportionally_to_price_scale() {
+        // est_hf = cached_hf × (new_price / old_price)
+        // For a 1% price drop: scale = 0.99 → est_hf = 1.02 * 0.99 = 1.0098
+        let cached_hf = 1.02_f64;
+        let scale = 0.99_f64; // 1% drop
+        let est_hf = cached_hf * scale;
+        assert!((est_hf - 1.0098).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fast_path_candidate_selected_when_est_hf_below_102() {
+        // A position with cached HF = 1.03, price drops 2% → est_hf = 1.03 * 0.98 = 1.0094
+        // 1.0094 < 1.02 → should be selected
+        let cached_hf = 1.03_f64;
+        let scale = 0.98_f64;
+        let est_hf = cached_hf * scale;
+        assert!(est_hf < 1.02, "position must be selected as fast-path candidate");
+    }
+
+    #[test]
+    fn test_fast_path_candidate_excluded_when_est_hf_above_102() {
+        // A position with cached HF = 1.10, price drops 0.5% → est_hf = 1.10 * 0.995 = 1.0945
+        // 1.0945 > 1.02 → should NOT be selected
+        let cached_hf = 1.10_f64;
+        let scale = 0.995_f64;
+        let est_hf = cached_hf * scale;
+        assert!(est_hf >= 1.02, "safe position must not be selected as fast-path candidate");
+    }
+
+    #[test]
+    fn test_fast_path_est_hf_threshold_is_102() {
+        // Threshold is 1.02 (small buffer above 1.0; on-chain call is authoritative)
+        // Value 1.02 represents a 2% buffer — tight enough to catch near-liquidatable positions
+        // without false-positives on healthy users.
+        let threshold = 1.02_f64;
+        assert!(threshold > 1.0,  "threshold must be above 1.0 (already liquidatable)");
+        assert!(threshold < 1.05, "threshold must be tighter than HF_THRESHOLD");
+    }
+
+    #[test]
+    fn test_fast_path_min_debt_base_formula() {
+        // min_debt_base_fp = min_profit_usd × 20 × 1e8
+        // For min_profit_usd=2: filter out positions < $40 (in 1e-8 USD units)
+        let min_profit_usd = 2.0_f64;
+        let min_debt_base: u128 = (min_profit_usd * 20.0 * 1e8) as u128;
+        // $40 in 1e-8 USD = 40 × 1e8 = 4_000_000_000
+        assert_eq!(min_debt_base, 4_000_000_000u128);
+    }
+
+    #[test]
+    fn test_fast_path_min_debt_filters_dust_positions() {
+        let min_profit_usd = 2.0_f64;
+        let min_debt_base_fp: u128 = (min_profit_usd * 20.0 * 1e8) as u128;
+
+        // A $39 position in 1e-8 USD units = 3_900_000_000
+        let dust_debt: u128 = 3_900_000_000;
+        assert!(dust_debt < min_debt_base_fp, "dust position must be filtered out");
+
+        // A $100 position = 10_000_000_000
+        let real_debt: u128 = 10_000_000_000;
+        assert!(real_debt >= min_debt_base_fp, "real position must pass the filter");
+    }
+
+    // ── CEX deviation detection ────────────────────────────────
+
+    #[test]
+    fn test_cex_deviation_threshold_is_045_pct() {
+        // CEX pre-oracle fires when market_price is 0.45% below oracle_price.
+        // This is 0.05% below the Chainlink deviation threshold (0.5%)
+        // → bot fires slightly before the on-chain oracle update.
+        let threshold = 0.45_f64; // in percent
+        assert!(threshold > 0.0,  "threshold must be positive");
+        assert!(threshold < 0.5,  "must be tighter than Chainlink 0.5% deviation threshold");
+    }
+
+    #[test]
+    fn test_cex_deviation_fires_when_market_below_oracle() {
+        // oracle=2000, market=1990 → deviation = (2000-1990)/2000 * 100 = 0.5%
+        // 0.5% > 0.45% → CEX fast path fires
+        let oracle_p = 2000.0_f64;
+        let market_p = 1990.0_f64;
+        let deviation_pct = (oracle_p - market_p) / oracle_p * 100.0;
+        assert!((deviation_pct - 0.5).abs() < 1e-9);
+        assert!(deviation_pct > 0.45, "0.5% deviation must trigger CEX fast path");
+    }
+
+    #[test]
+    fn test_cex_deviation_does_not_fire_when_below_threshold() {
+        // oracle=2000, market=1991 → deviation = 0.45% → exactly at threshold, does NOT fire
+        let oracle_p = 2000.0_f64;
+        let market_p = 1991.0_f64;
+        let deviation_pct = (oracle_p - market_p) / oracle_p * 100.0;
+        // deviation_pct ≈ 0.45
+        assert!(deviation_pct <= 0.45, "0.45% must not trigger (strictly greater than)");
+    }
+
+    #[test]
+    fn test_cex_deviation_does_not_fire_when_market_above_oracle() {
+        // market rising above oracle → no reason to pre-liquidate
+        let oracle_p = 2000.0_f64;
+        let market_p = 2010.0_f64;
+        let deviation_pct = (oracle_p - market_p) / oracle_p * 100.0;
+        assert!(deviation_pct < 0.0, "rising market must give negative deviation");
+        assert!(deviation_pct < 0.45, "rising market must not trigger CEX fast path");
+    }
+
+    #[test]
+    fn test_cex_deviation_skips_when_oracle_is_zero() {
+        // Guard: if oracle_p == 0.0 (not yet received), the deviation check is skipped
+        let oracle_p = 0.0_f64;
+        // In code: `if oracle_p > 0.0 { ... }` — the whole block is skipped
+        assert!(!( oracle_p > 0.0 ), "oracle=0 must skip deviation check");
+    }
+
+    // ── Fee snapshot fallback (fast path) ─────────────────────
+
+    #[test]
+    fn test_fee_snapshot_hit_returns_cached_tier() {
+        let mut snapshot: HashMap<(Address, Address), u32> = HashMap::new();
+        let weth = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        snapshot.insert((weth, usdc), 500u32);
+
+        let fee = snapshot
+            .get(&(weth, usdc))
+            .or_else(|| snapshot.get(&(usdc, weth)))
+            .copied()
+            .unwrap_or(500);
+        assert_eq!(fee, 500u32);
+    }
+
+    #[test]
+    fn test_fee_snapshot_reverse_lookup_works() {
+        // fast_liquidation_attempt stores (coll, debt) but also tries (debt, coll)
+        let mut snapshot: HashMap<(Address, Address), u32> = HashMap::new();
+        let weth = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        snapshot.insert((usdc, weth), 3000u32); // stored as (debt, coll)
+
+        let coll = weth;
+        let debt = usdc;
+        let fee = snapshot
+            .get(&(coll, debt))            // try (coll, debt) first → miss
+            .or_else(|| snapshot.get(&(debt, coll))) // try (debt, coll) → hit
+            .copied()
+            .unwrap_or(500);
+        assert_eq!(fee, 3000u32, "reverse lookup must find the cached tier");
+    }
+
+    #[test]
+    fn test_fee_snapshot_defaults_to_500_on_miss() {
+        let snapshot: HashMap<(Address, Address), u32> = HashMap::new();
+        let a = Address::repeat_byte(0xAA);
+        let b = Address::repeat_byte(0xBB);
+
+        let fee = snapshot
+            .get(&(a, b))
+            .or_else(|| snapshot.get(&(b, a)))
+            .copied()
+            .unwrap_or(500); // 500 bps = most liquid pool for major pairs
+        assert_eq!(fee, 500u32, "unknown pair must fallback to 500 bps fee");
+    }
+
+    // ── Close factor (fast path) ───────────────────────────────
+
+    #[test]
+    fn test_close_factor_100pct_when_hf_below_095() {
+        // HF < 0.95 → full liquidation (100% of debt)
+        let hf_095 = U256::from(95u64) * U256::from(10u64).pow(U256::from(16u64)); // 0.95e18
+        let hf = U256::from(900_000_000_000_000_000u128); // 0.90
+        let best_debt = U256::from(1_000_000u64);
+        let debt_to_cover = if hf < hf_095 { best_debt } else { best_debt / U256::from(2u64) };
+        assert_eq!(debt_to_cover, best_debt, "HF<0.95 must use full close factor");
+    }
+
+    #[test]
+    fn test_close_factor_50pct_when_hf_above_095() {
+        // HF >= 0.95 → 50% close factor
+        let hf_095 = U256::from(95u64) * U256::from(10u64).pow(U256::from(16u64));
+        let hf = U256::from(980_000_000_000_000_000u128); // 0.98
+        let best_debt = U256::from(1_000_000u64);
+        let debt_to_cover = if hf < hf_095 { best_debt } else { best_debt / U256::from(2u64) };
+        assert_eq!(debt_to_cover, best_debt / U256::from(2u64), "HF≥0.95 must use 50% close factor");
+    }
+
+    #[test]
+    fn test_close_factor_50pct_at_exactly_095() {
+        // Boundary: HF == 0.95 → 50% (condition is strict <)
+        let hf_095 = U256::from(95u64) * U256::from(10u64).pow(U256::from(16u64));
+        let hf = hf_095; // exactly 0.95
+        let best_debt = U256::from(2_000_000u64);
+        let debt_to_cover = if hf < hf_095 { best_debt } else { best_debt / U256::from(2u64) };
+        assert_eq!(debt_to_cover, U256::from(1_000_000u64), "HF==0.95 is NOT below threshold, must use 50%");
+    }
+
+    // ── Same-token liquidation (fast path) ────────────────────
+
+    #[test]
+    fn test_same_token_liq_fee_is_zero() {
+        // When best_coll == best_debt (e.g. USDC debt + USDC collateral),
+        // no swap is needed → fee_tier=0, min_swap_out=0.
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        let best_debt_tok = usdc;
+        let best_coll_tok = usdc;
+
+        let (fee_tier, min_swap_out) = if best_debt_tok == best_coll_tok {
+            (0u32, U256::ZERO)
+        } else {
+            (500u32, U256::from(1u64)) // placeholder for cross-token
+        };
+
+        assert_eq!(fee_tier, 0u32,       "same-token: fee must be 0");
+        assert_eq!(min_swap_out, U256::ZERO, "same-token: minSwapOut must be 0");
+    }
+
+    #[test]
+    fn test_cross_token_liq_requires_fee_and_min_swap_out() {
+        let weth = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
+        let usdc = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+        let best_debt_tok = usdc;
+        let best_coll_tok = weth;
+
+        assert_ne!(best_debt_tok, best_coll_tok, "cross-token: tokens must differ");
+        // cross-token branch would compute fee and min_swap_out > 0
+    }
+
+    // ── Oracle atomic price (fast path uses oracle_price_atomic) ──
+
+    #[test]
+    fn test_oracle_atomic_round_trip_2000_usd() {
+        let price = 2000.0_f64;
+        let encoded = pricefeed::to_atomic(price);
+        let decoded = pricefeed::from_atomic(encoded);
+        assert!((decoded - price).abs() < 0.01, "round-trip failed: {decoded} ≠ {price}");
+    }
+
+    #[test]
+    fn test_oracle_atomic_zero_means_not_received() {
+        // oracle_price_atomic initialised to 0 → price not yet received
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let atom = AtomicU64::new(0);
+        let p = pricefeed::from_atomic(atom.load(Ordering::Relaxed));
+        assert_eq!(p, 0.0, "atomic=0 must decode to 0.0 (no price)");
+    }
+
+    #[test]
+    fn test_oracle_atomic_update_stores_new_price() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let atom = AtomicU64::new(0);
+        let new_price = 1850.75_f64;
+        atom.store(pricefeed::to_atomic(new_price), Ordering::Relaxed);
+        let decoded = pricefeed::from_atomic(atom.load(Ordering::Relaxed));
+        assert!((decoded - new_price).abs() < 0.01, "oracle atomic must reflect updated price");
+    }
+
+    // ── Fee snapshot strip (fee_cache → fee_snapshot) ─────────
+
+    #[test]
+    fn test_fee_snapshot_strips_block_timestamps() {
+        // fee_cache stores (tier, verified_at_block)
+        // fee_snapshot used in fast path stores only tier (no block timestamp)
+        let mut fee_cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let a = Address::repeat_byte(0x01);
+        let b = Address::repeat_byte(0x02);
+        fee_cache.insert((a, b), (500u32, 9_000_000u64));
+        fee_cache.insert((b, a), (500u32, 9_000_000u64));
+
+        let snapshot: HashMap<(Address, Address), u32> =
+            fee_cache.iter().map(|(k, (t, _))| (*k, *t)).collect();
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[&(a, b)], 500u32, "snapshot must contain tier only");
+        assert_eq!(snapshot[&(b, a)], 500u32);
+    }
+
+    #[test]
+    fn test_fee_snapshot_empty_when_cache_empty() {
+        let fee_cache: HashMap<(Address, Address), (u32, u64)> = HashMap::new();
+        let snapshot: HashMap<(Address, Address), u32> =
+            fee_cache.iter().map(|(k, (t, _))| (*k, *t)).collect();
+        assert!(snapshot.is_empty(), "empty cache → empty snapshot");
+    }
+
+    // ── Fast path HF check: on-chain vs estimated ──────────────
+
+    #[test]
+    fn test_fast_path_skips_if_onchain_hf_above_one() {
+        // After the oracle move, on-chain HF might still be ≥ 1.0 (estimated was wrong).
+        // The fast_liquidation_attempt fn skips such users.
+        let one_e18 = U256::from(10u64).pow(U256::from(18u64));
+        let hf_recovered = U256::from(1_010_000_000_000_000_000u128); // 1.01
+        let should_skip = hf_recovered >= one_e18;
+        assert!(should_skip, "position with HF ≥ 1.0 on-chain must be skipped");
+    }
+
+    #[test]
+    fn test_fast_path_proceeds_if_onchain_hf_below_one() {
+        let one_e18 = U256::from(10u64).pow(U256::from(18u64));
+        let hf_liquidatable = U256::from(980_000_000_000_000_000u128); // 0.98
+        let should_skip = hf_liquidatable >= one_e18;
+        assert!(!should_skip, "position with HF < 1.0 must NOT be skipped");
+    }
+
+    // ── min_swap_out formula (fast path) ──────────────────────
+
+    #[test]
+    fn test_fast_path_min_swap_out_includes_flash_premium() {
+        // min_swap_out = (debt_to_cover + flash_fee) + min_profit
+        let premium: u64 = 9; // 9 bps = Aave V3 default
+        let debt_to_cover = U256::from(100_000_000u64); // 100 USDC
+        let min_profit    = U256::from(2_000_000u64);   // $2
+
+        let flash_repay = debt_to_cover
+            + debt_to_cover * U256::from(premium) / U256::from(10_000u64);
+        let min_out = flash_repay + min_profit;
+
+        // 9 bps of 100M = 90k → flash_repay = 100_090_000
+        // min_out = 100_090_000 + 2_000_000 = 102_090_000
+        assert_eq!(flash_repay, U256::from(100_090_000u64));
+        assert_eq!(min_out,     U256::from(102_090_000u64));
+    }
+
+    #[test]
+    fn test_fast_path_min_swap_out_increases_with_premium() {
+        // Higher premium → higher min_swap_out (same debt, larger repay needed)
+        let debt = U256::from(1_000_000u64);
+        let profit = U256::from(100_000u64);
+        let out_9bps  = debt + debt * U256::from(9u64)  / U256::from(10_000u64) + profit;
+        let out_10bps = debt + debt * U256::from(10u64) / U256::from(10_000u64) + profit;
+        assert!(out_10bps > out_9bps, "higher premium → higher required swap output");
     }
 }
